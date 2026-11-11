@@ -40,9 +40,9 @@ const IPS_MODULES = ['cadena_frio', 'citologia', 'ambulancias'] // módulos del 
 // Módulos por usuario: el administrador puede mostrar u ocultar módulos a cada usuario.
 // users.modules = null usa los del rol; un arreglo los reemplaza. El administrador ve todo.
 // ======================================================================
-const MODULE_KEYS = ['ips_dashboard', 'citologias', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario']
+const MODULE_KEYS = ['ips_dashboard', 'citologias', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano']
 const ROLE_MODULES = {
-  empleado: ['ips_dashboard', 'citologias', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota'],
+  empleado: ['ips_dashboard', 'citologias', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano'],
   voluntario: ['socorro', 'educacion', 'voluntario'],
   conductor: ['flota', 'traslado'],
   administrador: MODULE_KEYS
@@ -53,7 +53,7 @@ const ROUTE_MODULES = [
   ['/citologias', ['citologias']], ['/registrar-toma-de-muestras-citologicas', ['citologias']], ['/consultar-citologias', ['citologias']],
   ['/registrar-temperatura', ['temperatura']], ['/reporte-temperatura', ['temperatura']], ['/temperatura', ['temperatura']],
   ['/ambulancias-dashboard', ['traslado']], ['/equipos', ['equipos']], ['/dashboard', ['ips_dashboard']],
-  ['/socorro/dashboard', ['og_dashboard']], ['/socorro/reporte-voluntarios', ['reporte_voluntarios']], ['/socorro/eventos', ['socorro', 'educacion']], ['/socorro/inventario', ['socorro', 'educacion']],
+  ['/estandares/th', ['talento_humano']], ['/socorro/dashboard', ['og_dashboard']], ['/socorro/reporte-voluntarios', ['reporte_voluntarios']], ['/socorro/eventos', ['socorro', 'educacion']], ['/socorro/inventario', ['socorro', 'educacion']],
   ['/socorro/personas', ['personas', 'socorro', 'educacion']], ['/inventario', ['inventario']], ['/voluntario/panel', ['voluntario']],
   ['/vehiculos', ['flota', 'traslado']]
 ]
@@ -1125,6 +1125,7 @@ require('./inspections')(app, { supabase, auth, h, fail, clean, ISO_DATE, TZ, TZ
 // Módulo IPS: hoja de vida de equipos
 require('./inventory')(app, { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ_OFFSET, todayBogota, ...SCOPE })
 require('./equipment')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
+require('./talento')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
 require('./signatures')(app, { supabase, auth, h, fail, clean, ADMIN, uploadImage, removeStoredFile, canAccessSite })
 require('./vehicles')(app, { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 

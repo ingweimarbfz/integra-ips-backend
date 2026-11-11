@@ -60,6 +60,7 @@ module.exports = (app, deps) => {
     return data
   }
   const siteOf = (req, siteId) => { if (siteId && !canAccessSite(req, siteId)) throw httpError(404, 'Documento no encontrado') }
+  const isStaffSelf = (s, u) => (s.user_id && s.user_id === u.id) || (s.document && s.document === u.identification)
   const RULES = {
     citologia: async (req, key, slot) => {
       const c = await loadOne('cytology_samples', 'id, site_id, elabora, toma_muestra', key)
@@ -110,6 +111,17 @@ module.exports = (app, deps) => {
       siteOf(req, e.site_id)
       if (!STAFF.includes(req.user.role)) throw httpError(403, 'Sin permiso para firmar esta hoja de vida')
       if (!['mantenimiento', 'coordinacion'].includes(slot)) throw httpError(400, 'Casilla de firma inválida')
+    },
+    // Talento humano: el profesional firma su hoja de vida y su lista de chequeo; quien verifica y la coordinación firman la suya.
+    th_chequeo: async (req, key, slot) => {
+      const c = await loadOne('th_checklists', 'id, reviewer_id, staff:th_staff(site_id, user_id, document, first_name, last_name)', key)
+      siteOf(req, c.staff.site_id)
+      if (slot === 'verifica') { if (c.reviewer_id !== req.user.id) throw httpError(403, 'Solo quien realizó la verificación puede firmar esta casilla') } else if (slot === 'profesional') { if (!isStaffSelf(c.staff, req.user)) throw httpError(403, `Solo ${c.staff.first_name} ${c.staff.last_name} puede firmar esta casilla`) } else if (slot === 'coordinacion') { if (!STAFF.includes(req.user.role)) throw httpError(403, 'Esta casilla la firma la coordinación') } else throw httpError(400, 'Casilla de firma inválida')
+    },
+    th_hoja_vida: async (req, key, slot) => {
+      const s = await loadOne('th_staff', 'id, site_id, user_id, document, first_name, last_name', key)
+      siteOf(req, s.site_id)
+      if (slot === 'profesional') { if (!isStaffSelf(s, req.user)) throw httpError(403, `Solo ${s.first_name} ${s.last_name} puede firmar esta casilla`) } else if (slot === 'talento_humano') { if (!STAFF.includes(req.user.role)) throw httpError(403, 'Esta casilla la firma talento humano') } else throw httpError(400, 'Casilla de firma inválida')
     }
   }
   const sigDTO = (s) => ({ id: s.id, slot: s.slot, userId: s.user_id, signerName: s.signer_name, signerIdentification: s.signer_identification, signatureUrl: s.signature_url, signedAt: s.signed_at })
@@ -142,21 +154,22 @@ module.exports = (app, deps) => {
   // ---------------------------------------------------------------- Pendientes por firmar del usuario
   // Solo las casillas que tienen un firmante definido: el profesional de la citología, el coordinador del evento,
   // el conductor del reporte/preoperacional y, para el administrador, el "Revisó" de flota (últimos 30 días).
-  const SLOT_LABELS = { elabora: 'Elaboró historia', toma_muestra: 'Tomó la muestra', coordinador: 'Coordinador', conductor: 'Conductor', reviso: 'Revisó', persona: 'Salida de personal' }
+  const SLOT_LABELS = { elabora: 'Elaboró historia', toma_muestra: 'Tomó la muestra', coordinador: 'Coordinador', conductor: 'Conductor', reviso: 'Revisó', persona: 'Salida de personal', verifica: 'Verificó', profesional: 'Profesional' }
   const pendingFor = async (user) => {
     const name = norm(fullName(user))
     const since = new Date(Date.now() - 30 * 86400000).toISOString()
     const admin = user.role === 'administrador'
-    const [cyto, events, trips, insp, signed] = await Promise.all([
+    const [cyto, events, trips, insp, signed, thc] = await Promise.all([
       ['administrador', 'empleado'].includes(user.role) ? supabase.from('cytology_samples').select('id, num_factura, nombre, apellidos, fecha_examen, elabora, toma_muestra').order('fecha_examen', { ascending: false }).limit(500) : { data: [] },
       supabase.from('gso_events').select('id, code, name, area, ended_at, status, coordinator:volunteers!gso_events_coordinator_id_fkey(document)').eq('status', 'finalizado').order('ended_at', { ascending: false }).limit(300),
       admin ? supabase.from('vehicle_trips').select('id, code, activity, driver_id, status, ended_at, vehicles(movil)').eq('status', 'cerrado').gte('ended_at', since).order('ended_at', { ascending: false })
         : supabase.from('vehicle_trips').select('id, code, activity, driver_id, status, ended_at, vehicles(movil)').eq('driver_id', user.id).eq('status', 'cerrado').order('ended_at', { ascending: false }).limit(100),
       admin ? supabase.from('vehicle_inspections').select('id, code, driver_id, inspected_at, result, vehicles(movil)').gte('inspected_at', since).order('inspected_at', { ascending: false })
         : supabase.from('vehicle_inspections').select('id, code, driver_id, inspected_at, result, vehicles(movil)').eq('driver_id', user.id).order('inspected_at', { ascending: false }).limit(100),
-      supabase.from('document_signatures').select('doc_type, doc_key, slot').in('doc_type', ['citologia', 'evento', 'reporte_vehiculo', 'preoperacional'])
+      supabase.from('document_signatures').select('doc_type, doc_key, slot').in('doc_type', ['citologia', 'evento', 'reporte_vehiculo', 'preoperacional', 'th_chequeo']),
+      supabase.from('th_checklists').select('id, code, check_date, result, reviewer_id, staff:th_staff(id, user_id, document, first_name, last_name)').order('check_date', { ascending: false }).limit(300)
     ])
-    for (const r of [cyto, events, trips, insp, signed]) if (r.error) throw r.error
+    for (const r of [cyto, events, trips, insp, signed, thc]) if (r.error) throw r.error
     const done = new Set(signed.data.map((x) => `${x.doc_type}|${x.doc_key}|${x.slot}`))
     const out = []
     const add = (o) => { if (!done.has(`${o.docType}|${o.docKey}|${o.slot}`)) out.push({ ...o, slotLabel: SLOT_LABELS[o.slotKind || o.slot] }) }
@@ -191,6 +204,11 @@ module.exports = (app, deps) => {
       const base = { docType: 'preoperacional', docKey: String(r.id), title: `Preoperacional ${r.code}`, subtitle: `Móvil ${r.vehicles?.movil ?? ''} · ${r.result === 'apto' ? 'Apto' : 'No apto'}`, date: r.inspected_at, link: `/socorro/vehiculos/preoperacional/${r.id}` }
       if (r.driver_id === user.id) add({ ...base, slot: 'conductor' })
       if (admin) add({ ...base, slot: 'reviso' })
+    }
+    for (const c of thc.data) {
+      const base = { docType: 'th_chequeo', docKey: String(c.id), title: `Lista de chequeo ${c.code}`, subtitle: `${c.staff.first_name} ${c.staff.last_name} · ${c.result === 'cumple' ? 'Cumple' : 'No cumple'}`, date: c.check_date, link: `/estandares/talento-humano/chequeo/${c.id}` }
+      if (c.reviewer_id === user.id) add({ ...base, slot: 'verifica' })
+      if (isStaffSelf(c.staff, user)) add({ ...base, slot: 'profesional' })
     }
     return out.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))
   }
