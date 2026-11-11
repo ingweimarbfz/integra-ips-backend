@@ -116,7 +116,7 @@ module.exports = (app, deps) => {
     th_chequeo: async (req, key, slot) => {
       const c = await loadOne('th_checklists', 'id, reviewer_id, staff:th_staff(site_id, user_id, document, first_name, last_name)', key)
       siteOf(req, c.staff.site_id)
-      if (slot === 'verifica') { if (c.reviewer_id !== req.user.id) throw httpError(403, 'Solo quien realizó la verificación puede firmar esta casilla') } else if (slot === 'profesional') { if (!isStaffSelf(c.staff, req.user)) throw httpError(403, `Solo ${c.staff.first_name} ${c.staff.last_name} puede firmar esta casilla`) } else if (slot === 'coordinacion') { if (!STAFF.includes(req.user.role)) throw httpError(403, 'Esta casilla la firma la coordinación') } else throw httpError(400, 'Casilla de firma inválida')
+      if (slot === 'verifica') { if (c.reviewer_id !== req.user.id) throw httpError(403, 'Solo quien realizó la verificación puede firmar esta casilla') } else if (slot === 'profesional') { if (!isStaffSelf(c.staff, req.user)) throw httpError(403, `Solo ${c.staff.first_name} ${c.staff.last_name} puede firmar esta casilla`) } else if (slot === 'coordinacion') { if (!STAFF.includes(req.user.role)) throw httpError(403, 'La casilla Revisó la firma la coordinación') } else throw httpError(400, 'Casilla de firma inválida')
     },
     th_hoja_vida: async (req, key, slot) => {
       const s = await loadOne('th_staff', 'id, site_id, user_id, document, first_name, last_name', key)
@@ -154,7 +154,7 @@ module.exports = (app, deps) => {
   // ---------------------------------------------------------------- Pendientes por firmar del usuario
   // Solo las casillas que tienen un firmante definido: el profesional de la citología, el coordinador del evento,
   // el conductor del reporte/preoperacional y, para el administrador, el "Revisó" de flota (últimos 30 días).
-  const SLOT_LABELS = { elabora: 'Elaboró historia', toma_muestra: 'Tomó la muestra', coordinador: 'Coordinador', conductor: 'Conductor', reviso: 'Revisó', persona: 'Salida de personal', verifica: 'Verificó', profesional: 'Profesional' }
+  const SLOT_LABELS = { elabora: 'Elaboró historia', toma_muestra: 'Tomó la muestra', coordinador: 'Coordinador', conductor: 'Conductor', reviso: 'Revisó', persona: 'Salida de personal', verifica: 'Verificó', profesional: 'Profesional', coordinacion: 'Revisó' }
   const pendingFor = async (user) => {
     const name = norm(fullName(user))
     const since = new Date(Date.now() - 30 * 86400000).toISOString()
@@ -208,7 +208,6 @@ module.exports = (app, deps) => {
     for (const c of thc.data) {
       const base = { docType: 'th_chequeo', docKey: String(c.id), title: `Lista de chequeo ${c.code}`, subtitle: `${c.staff.first_name} ${c.staff.last_name} · ${c.result === 'cumple' ? 'Cumple' : 'No cumple'}`, date: c.check_date, link: `/estandares/talento-humano/chequeo/${c.id}` }
       if (c.reviewer_id === user.id) add({ ...base, slot: 'verifica' })
-      if (isStaffSelf(c.staff, user)) add({ ...base, slot: 'profesional' })
     }
     return out.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))
   }
