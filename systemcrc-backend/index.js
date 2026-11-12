@@ -20,8 +20,27 @@ if (!SUPABASE_URL || !SUPABASE_SECRET_KEY || !JWT_SECRET) {
 }
 
 // Cliente con la clave secreta: solo vive en el servidor, nunca en el navegador.
+// Si la red cambia (Wi-Fi, VPN, suspensión del equipo) una conexión reutilizada puede quedar colgada
+// y la app se queda "cargando". Cada consulta tiene un tiempo límite; las lecturas (GET/HEAD) se reintentan una vez.
+const SB_TIMEOUT = { read: 15000, write: 60000 }
+const fetchWithTimeout = async (url, opts = {}) => {
+  const method = String(opts.method || 'GET').toUpperCase()
+  const read = method === 'GET' || method === 'HEAD'
+  for (let attempt = 0; ; attempt++) {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(new Error('Tiempo de espera agotado con la base de datos')), read ? SB_TIMEOUT.read : SB_TIMEOUT.write)
+    if (opts.signal) opts.signal.addEventListener('abort', () => ctrl.abort(opts.signal.reason), { once: true })
+    try {
+      return await fetch(url, { ...opts, signal: ctrl.signal })
+    } catch (e) {
+      if (!read || attempt >= 1 || opts.signal?.aborted) throw e
+      console.warn(`[supabase] reintentando ${method} tras: ${e.message}`)
+    } finally { clearTimeout(timer) }
+  }
+}
 const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false }
+  auth: { persistSession: false, autoRefreshToken: false },
+  global: { fetch: fetchWithTimeout }
 })
 
 const app = express()
@@ -44,19 +63,22 @@ const IPS_MODULES = ['cadena_frio', 'citologia', 'ambulancias'] // módulos del 
 // Módulos por usuario: el administrador puede mostrar u ocultar módulos a cada usuario.
 // users.modules = null usa los del rol; un arreglo los reemplaza. El administrador ve todo.
 // ======================================================================
-const MODULE_KEYS = ['ips_dashboard', 'citologias', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica']
+const MODULE_KEYS = ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales']
 const ROLE_MODULES = {
-  empleado: ['ips_dashboard', 'citologias', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica'],
+  empleado: ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales'],
   voluntario: ['socorro', 'educacion', 'voluntario'],
   conductor: ['flota', 'traslado'],
   administrador: MODULE_KEYS
 }
 // El plan contratado (plataforma) limita los módulos de todos, incluido el administrador.
 const inPlan = (m) => !platform.state.modules || platform.state.modules.includes(m)
+// Funciones del plan que no son módulos del menú (p. ej. envío de documentos, recordatorios automáticos).
+const hasFeature = (k) => !platform.state.features || platform.state.features.includes(k)
 const userModules = (u) => (u.role === 'administrador' ? MODULE_KEYS : Array.isArray(u.modules) ? u.modules.filter((m) => MODULE_KEYS.includes(m)) : ROLE_MODULES[u.role] || []).filter(inPlan)
 // Ruta → módulo (el primero que coincide). Las rutas sin módulo solo dependen del rol.
 const ROUTE_MODULES = [
   ['/citologias', ['citologias']], ['/registrar-toma-de-muestras-citologicas', ['citologias']], ['/consultar-citologias', ['citologias']],
+  ['/facturacion', ['facturacion']], ['/calidad', ['doc_generales']], ['/vacunacion', ['vacunacion']],
   ['/registrar-temperatura', ['temperatura']], ['/reporte-temperatura', ['temperatura']], ['/temperatura', ['temperatura']],
   ['/ambulancias-dashboard', ['traslado']], ['/equipos', ['equipos']], ['/dashboard', ['ips_dashboard']],
   ['/estandares/th', ['talento_humano']], ['/estandares/documentos/procesos_prioritarios', ['procesos_prioritarios']], ['/estandares/documentos/interdependencia', ['interdependencia']], ['/estandares/documentos/medicamentos', ['medicamentos']], ['/estandares/documentos/infraestructura', ['infraestructura']], ['/estandares/documentos/historia_clinica', ['historia_clinica']], ['/socorro/dashboard', ['og_dashboard']], ['/socorro/reporte-voluntarios', ['reporte_voluntarios']], ['/socorro/eventos', ['socorro', 'educacion']], ['/socorro/inventario', ['socorro', 'educacion']],
@@ -526,7 +548,9 @@ app.put('/servicios-ips/:id/configuracion', auth(ADMIN), h(async (req, res) => {
   const custom = (Array.isArray(b.custom) ? b.custom : []).map((c) => ({ name: clean(c?.name), value: clean(String(c?.value ?? '')) })).filter((c) => c.name)
   if (new Set(custom.map((c) => c.name.toLowerCase())).size !== custom.length) errors.push('Hay parámetros con el mismo nombre')
   if (errors.length) return fail(res, errors.join('. '), 400)
-  const { error } = await supabase.from('ips_services').update({ settings: { ...next, custom } }).eq('id', id)
+  // Los recordatorios de temperatura se guardan aparte (/temperatura/recordatorios): se conservan.
+  const keep = svc.settings?.reminders ? { reminders: svc.settings.reminders } : {}
+  const { error } = await supabase.from('ips_services').update({ settings: { ...next, custom, ...keep } }).eq('id', id)
   if (error) throw error
   res.send(await serviceById(id))
 }))
@@ -680,9 +704,7 @@ const SERVICE_SETTINGS = {
     { key: 'temp_min', label: 'Temperatura mínima permitida', type: 'number', unit: '°C', step: 0.5, required: true, default: 15 },
     { key: 'temp_max', label: 'Temperatura máxima permitida', type: 'number', unit: '°C', step: 0.5, required: true, default: 24, help: 'Las lecturas fuera de este rango generan alerta.' }
   ],
-  citologia: [
-    { key: 'precio', label: 'Valor de la citología', type: 'number', unit: 'COP', step: 500, min: 0, required: true, default: 35000, help: 'Se carga por defecto al registrar una citología.' }
-  ],
+  citologia: [], // el valor de la citología está en Facturación → Tarifario
   ambulancias: []
 }
 const serviceSettings = async (module) => {
@@ -695,10 +717,10 @@ const getSettings = async () => {
   const [{ data: s, error }, cold, cyto] = await Promise.all([
     supabase.from('app_settings').select('*').eq('id', 1).single(),
     serviceSettings('cadena_frio'),
-    serviceSettings('citologia')
+    getCytologyPrice()
   ])
   if (error) throw error
-  const price = cyto.precio == null ? null : Number(cyto.precio)
+  const price = cyto
   return {
     ipsName: s.ips_name,
     shortName: s.short_name,
@@ -790,7 +812,7 @@ const isoDateBogota = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).
 
 // Dos lecturas al día por sede: una en la mañana y otra en la tarde.
 const SHIFTS = { manana: 'Mañana', tarde: 'Tarde' }
-const TEMP_SELECT = 'id, recorded_at, record_date, shift, temp_min, temp_max, site_id, updated_at, users:users!temperature_created_by_fkey(name, last_name), editor:users!temperature_updated_by_fkey(name, last_name)'
+const TEMP_SELECT = 'id, recorded_at, record_date, shift, slot, temp_min, temp_max, site_id, updated_at, users:users!temperature_created_by_fkey(name, last_name), editor:users!temperature_updated_by_fkey(name, last_name)'
 const currentShift = () => (Number(new Intl.DateTimeFormat('en-US', { timeZone: TZ, hour: 'numeric', hour12: false }).format(new Date())) % 24 < 12 ? 'manana' : 'tarde')
 const toTempDTO = (t) => {
   const d = new Date(t.recorded_at)
@@ -801,7 +823,7 @@ const toTempDTO = (t) => {
     isoDate: t.record_date || isoDateBogota(d),
     date: `${dd}/${m}/${y}`,
     time: formatTime(d),
-    shift: t.shift, shiftLabel: SHIFTS[t.shift],
+    shift: t.shift, shiftLabel: SHIFTS[t.shift], slot: t.slot || 1, slotLabel: `${SHIFTS[t.shift]} · ${t.slot || 1}.ª lectura`,
     tempMin: Number(t.temp_min),
     tempMax: Number(t.temp_max),
     siteId: t.site_id,
@@ -818,7 +840,84 @@ const validTemps = (b) => {
 }
 const dupShiftMsg = (shift) => `Ya hay un registro de la ${SHIFTS[shift].toLowerCase()} para hoy en esta sede. Puedes modificarlo en la tabla.`
 
-app.get('/temperatura/jornada', auth(STAFF), requireIps('cadena_frio'), (req, res) => res.send({ shift: currentShift(), date: todayBogota() }))
+
+// ---------------------------------------------------------------- Recordatorios del registro de temperatura
+// Cada día se registran 2 jornadas (mañana y tarde, cada una con mínima y máxima = 4 temperaturas).
+// A cada hora configurada se avisa si la jornada indicada aún no se registra.
+const DEFAULT_REMINDERS = { enabled: true, reminders: [{ time: '09:00', shift: 'manana' }, { time: '12:00', shift: 'manana' }, { time: '14:00', shift: 'tarde' }, { time: '18:00', shift: 'tarde' }] }
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/
+const coldService = async () => (await supabase.from('ips_services').select('id, settings, active').eq('module', 'cadena_frio').maybeSingle()).data
+const reminderConfig = (svc) => {
+  const r = svc?.settings?.reminders
+  return r && Array.isArray(r.reminders) ? { enabled: r.enabled !== false, reminders: r.reminders } : DEFAULT_REMINDERS
+}
+// Lecturas del día: una por cada hora de recordatorio (por defecto 2 en la mañana y 2 en la tarde).
+// Cada lectura registra la temperatura mínima y máxima del termómetro de la nevera.
+// Cada lectura se habilita desde 30 minutos antes de su hora y deben registrarse en orden
+// (mañana 1.ª → mañana 2.ª → tarde 1.ª → tarde 2.ª): no se puede adelantar una lectura de la tarde en la mañana.
+const READING_EARLY_MIN = 30
+const shiftHHMM = (hhmm, delta) => { const [h, m] = hhmm.split(':').map(Number); const t = Math.max(0, Math.min(1439, h * 60 + m + delta)); return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}` }
+const readingPlan = (cfg) => {
+  const out = []
+  for (const shift of Object.keys(SHIFTS)) {
+    const times = (cfg.reminders || []).filter((r) => r.shift === shift).map((r) => r.time).sort().slice(0, 4)
+    const list = times.length ? times : (shift === 'manana' ? ['08:00', '12:00'] : ['14:00', '18:00'])
+    list.forEach((time, i) => out.push({ shift, slot: i + 1, time, opensAt: shiftHHMM(time, -READING_EARLY_MIN), label: `${SHIFTS[shift]} · ${i + 1}.ª lectura (${time})` }))
+  }
+  return out
+}
+const slotKey = (shift, slot) => `${shift}-${slot || 1}`
+// Siguiente lectura en orden; no se puede saltar ni adelantar ni registrar antes de su hora.
+const pickReading = (plan, taken, shift, slot, now) => {
+  const next = plan.find((p) => !taken.has(slotKey(p.shift, p.slot)))
+  if (!next) return { error: `Hoy ya están las ${plan.length} lecturas del día.` }
+  const s = slot || (shift ? plan.find((p) => p.shift === shift && !taken.has(slotKey(shift, p.slot)))?.slot : null)
+  const want = shift || slot ? plan.find((p) => p.shift === (shift || next.shift) && p.slot === s) : next
+  if (!want) return { error: `Ya están las lecturas de la ${SHIFTS[shift || next.shift].toLowerCase()} de hoy` }
+  const name = (p) => `${p.slot}.ª lectura de la ${SHIFTS[p.shift].toLowerCase()}`
+  if (taken.has(slotKey(want.shift, want.slot))) return { error: `Ya se registró la ${name(want)} de hoy. Puedes modificarla en la tabla.` }
+  if (want !== next) return { error: `Las lecturas van en orden: primero registra la ${name(next)} (${next.time}).` }
+  if (now < want.opensAt) return { error: `Aún no es hora de la ${name(want)} (${want.time}). Se habilita a las ${want.opensAt}.` }
+  return { reading: want }
+}
+app.get('/temperatura/jornada', auth(STAFF), requireIps('cadena_frio'), h(async (req, res) => {
+  const plan = readingPlan(reminderConfig(await coldService()))
+  res.send({ shift: currentShift(), date: todayBogota(), now: nowHHMM(), plan })
+}))
+const nowHHMM = () => new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date())
+app.get('/temperatura/recordatorios', auth(STAFF), requireIps('cadena_frio'), h(async (req, res) => {
+  const svc = await coldService()
+  const cfg = reminderConfig(svc)
+  const today = todayBogota()
+  // Sedes a revisar: la del usuario, la filtrada, o todas las que tienen cadena de frío (administrador).
+  let siteIds = []
+  const scoped = scopeSite(req)
+  if (scoped) siteIds = [scoped]
+  else if (svc) siteIds = ((await supabase.from('site_services').select('site_id').eq('service_id', svc.id)).data || []).map((x) => x.site_id)
+  const [{ data: sites }, { data: temps }] = await Promise.all([
+    supabase.from('sites').select('id, name').in('id', siteIds.length ? siteIds : [0]),
+    supabase.from('temperature').select('site_id, shift, slot').eq('record_date', today).in('site_id', siteIds.length ? siteIds : [0])
+  ])
+  // Cada recordatorio corresponde a una lectura (1.ª o 2.ª de su jornada, por orden de hora).
+  const plan = readingPlan(cfg)
+  const reminders = cfg.reminders.map((r) => ({ ...r, slot: plan.find((p) => p.shift === r.shift && p.time === r.time)?.slot || 1 }))
+  res.send({
+    ...cfg, reminders, plan, today, now: nowHHMM(),
+    sites: (sites || []).map((x) => ({ siteId: x.id, siteName: x.name, done: Object.fromEntries(plan.map((p) => [slotKey(p.shift, p.slot), temps.some((t) => t.site_id === x.id && t.shift === p.shift && (t.slot || 1) === p.slot)])) }))
+  })
+}))
+app.put('/temperatura/recordatorios', auth(ADMIN), h(async (req, res) => {
+  const b = req.body || {}
+  const list = Array.isArray(b.reminders) ? b.reminders : []
+  if (list.length > 10) return fail(res, 'Máximo 10 recordatorios', 400)
+  for (const r of list) if (!HHMM.test(r?.time || '') || !SHIFTS[r?.shift]) return fail(res, 'Cada recordatorio necesita una hora válida (HH:MM) y una jornada', 400)
+  const reminders = [...new Map(list.map((r) => [r.time, { time: r.time, shift: r.shift }])).values()].sort((a, c) => a.time.localeCompare(c.time))
+  const svc = await coldService()
+  if (!svc) return fail(res, 'No hay un servicio de cadena de frío', 404)
+  const { error } = await supabase.from('ips_services').update({ settings: { ...(svc.settings || {}), reminders: { enabled: b.enabled !== false, reminders } } }).eq('id', svc.id)
+  if (error) throw error
+  res.send({ enabled: b.enabled !== false, reminders })
+}))
 
 app.post('/registrar-temperatura', auth(STAFF), requireIps('cadena_frio'), h(async (req, res) => {
   const v = validTemps(req.body)
@@ -827,18 +926,24 @@ app.post('/registrar-temperatura', auth(STAFF), requireIps('cadena_frio'), h(asy
   if (!SHIFTS[shift]) return fail(res, 'Jornada inválida (mañana o tarde)', 400)
   const siteId = await targetSite(req, req.body?.siteId)
   const today = todayBogota()
-  const { data: dup } = await supabase.from('temperature').select('id').eq('site_id', siteId).eq('record_date', today).eq('shift', shift).maybeSingle()
-  if (dup) return fail(res, dupShiftMsg(shift), 409)
+  const plan = readingPlan(reminderConfig(await coldService()))
+  // Lecturas del día (por defecto 4: dos en la mañana y dos en la tarde); completas, no se registra más hasta mañana.
+  const { data: dayRows } = await supabase.from('temperature').select('id, shift, slot').eq('site_id', siteId).eq('record_date', today)
+  const taken = new Set((dayRows || []).map((r) => slotKey(r.shift, r.slot)))
+  if (plan.every((p) => taken.has(slotKey(p.shift, p.slot)))) return fail(res, `Hoy ya están las ${plan.length} lecturas del día. El próximo registro se habilita mañana; si necesitas corregir una lectura, modifícala.`, 409)
+  const pick = pickReading(plan, taken, req.body?.shift ? shift : null, Number(req.body?.slot) || null, nowHHMM())
+  if (pick.error) return fail(res, pick.error, 409)
+  const want = pick.reading
   // La fecha/hora la pone la base de datos (now()), no el navegador.
   const { data, error } = await supabase.from('temperature')
-    .insert({ temp_min: v.tempMin, temp_max: v.tempMax, created_by: req.user.id, site_id: siteId, record_date: today, shift })
+    .insert({ temp_min: v.tempMin, temp_max: v.tempMax, created_by: req.user.id, site_id: siteId, record_date: today, shift: want.shift, slot: want.slot })
     .select(TEMP_SELECT).single()
   if (error) { if (error.code === '23505') return fail(res, dupShiftMsg(shift), 409); throw error }
   res.status(201).send(toTempDTO(data))
 }))
 
 const loadTemp = async (req) => {
-  const { data } = await supabase.from('temperature').select('id, site_id, record_date, shift').eq('id', Number(req.params.id)).maybeSingle()
+  const { data } = await supabase.from('temperature').select('id, site_id, record_date, shift, slot').eq('id', Number(req.params.id)).maybeSingle()
   if (!data || !canAccessSite(req, data.site_id)) return null
   return data
 }
@@ -850,12 +955,14 @@ app.put('/temperatura/:id', auth(STAFF), requireIps('cadena_frio'), h(async (req
   if (v.error) return fail(res, v.error, 400)
   const shift = req.body?.shift || cur.shift
   if (!SHIFTS[shift]) return fail(res, 'Jornada inválida (mañana o tarde)', 400)
-  if (shift !== cur.shift) {
-    const { data: dup } = await supabase.from('temperature').select('id').eq('site_id', cur.site_id).eq('record_date', cur.record_date).eq('shift', shift).maybeSingle()
-    if (dup) return fail(res, `Ese día ya tiene el registro de la ${SHIFTS[shift].toLowerCase()}`, 409)
+  const slot = Number(req.body?.slot) || cur.slot || 1
+  if (slot < 1 || slot > 4) return fail(res, 'Lectura inválida', 400)
+  if (shift !== cur.shift || slot !== (cur.slot || 1)) {
+    const { data: dup } = await supabase.from('temperature').select('id').eq('site_id', cur.site_id).eq('record_date', cur.record_date).eq('shift', shift).eq('slot', slot).maybeSingle()
+    if (dup) return fail(res, `Ese día ya tiene la ${slot}.ª lectura de la ${SHIFTS[shift].toLowerCase()}`, 409)
   }
   const { data, error } = await supabase.from('temperature')
-    .update({ temp_min: v.tempMin, temp_max: v.tempMax, shift, updated_by: req.user.id, updated_at: new Date().toISOString() })
+    .update({ temp_min: v.tempMin, temp_max: v.tempMax, shift, slot, updated_by: req.user.id, updated_at: new Date().toISOString() })
     .eq('id', cur.id).select(TEMP_SELECT).single()
   if (error) { if (error.code === '23505') return fail(res, 'Ese día ya tiene un registro en esa jornada', 409); throw error }
   res.send(toTempDTO(data))
@@ -873,7 +980,7 @@ app.delete('/temperatura/:id', auth(STAFF), requireIps('cadena_frio'), h(async (
 app.get('/reporte-temperatura', auth(STAFF), requireIps('cadena_frio'), h(async (req, res) => {
   const desde = clean(req.query.desde); const hasta = clean(req.query.hasta)
   if ((desde && !ISO_DATE.test(desde)) || (hasta && !ISO_DATE.test(hasta))) return fail(res, 'Fechas inválidas', 400)
-  let q = applyScope(supabase.from('temperature').select(TEMP_SELECT), scopeSite(req)).order('record_date').order('shift')
+  let q = applyScope(supabase.from('temperature').select(TEMP_SELECT), scopeSite(req)).order('record_date').order('shift').order('slot')
   if (desde) q = q.gte('record_date', desde)
   if (hasta) q = q.lte('record_date', hasta)
   const { data, error } = await q
@@ -900,15 +1007,22 @@ const CYTOLOGY_FIELDS = {
   email: 'email'
 }
 const SNAKE_TO_CAMEL = Object.fromEntries(Object.entries(CYTOLOGY_FIELDS).map(([c, s]) => [s, c]))
-Object.assign(SNAKE_TO_CAMEL, { valor_base: 'valorBase', discount_id: 'discountId', discount_name: 'discountName', discount_amount: 'discountAmount' })
+Object.assign(SNAKE_TO_CAMEL, { valor_base: 'valorBase', discount_id: 'discountId', discount_name: 'discountName', discount_amount: 'discountAmount', entity_id: 'entityId', eps_id: 'epsId', payment_mode: 'paymentMode', billing_status: 'billingStatus' })
 const toCamel = (r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [SNAKE_TO_CAMEL[k] || k, v]))
 const BOOLEAN_FIELDS = ['sano', 'normal', 'cupula', 'tomaVaginal', 'endoCerrado', 'polipo', 'quistes', 'lecorrea', 'sangra', 'erosionado', 'sinEspecificar']
 const NUMBER_FIELDS = ['valor', 'edad']
 const REQUIRED_CYTOLOGY = ['nombre', 'apellidos', 'numDocumento', 'fechaNacimiento', 'celular', 'elabora', 'tomaMuestra']
 
+// El valor de la citología sale del tarifario (Facturación → Tarifario): tarifa por defecto del servicio de citología.
+async function getCytologyTariff () {
+  const { data: svc } = await supabase.from('ips_services').select('id').eq('module', 'citologia').maybeSingle()
+  if (!svc) return null
+  const { data } = await supabase.from('service_tariffs').select('id, name, price, is_default').eq('service_id', svc.id).eq('active', true).order('is_default', { ascending: false }).order('id').limit(1)
+  return data?.[0] ? { ...data[0], serviceId: svc.id, price: Number(data[0].price) } : null
+}
 async function getCytologyPrice () {
-  const { precio } = await serviceSettings('citologia')
-  return precio == null ? null : Number(precio)
+  const t = await getCytologyTariff()
+  return t ? t.price : null
 }
 
 const getEmployees = async (siteId) => {
@@ -919,11 +1033,22 @@ const getEmployees = async (siteId) => {
 
 const nextCode = (prefix, value) => `${prefix}-${String((value ? Number(value.replace(/\D/g, '')) : 0) + 1).padStart(7, '0')}`
 
+// Entidades, EPS con convenio y cuentas de cobro (antes de /citologias/:id para que no se confundan las rutas).
+const billing = require('./billing')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite: (...a) => targetSite(...a), inPlan: (m) => inPlan(m) })
+// Cadena de frío: proveedores de los equipos (contacto cuando la temperatura supera el límite).
+const coldchain = require('./coldchain')(app, { supabase, auth, h, fail, clean, ADMIN, scopeSite, canAccessSite })
+// Servicio de vacunación: registro nominal, inventario de biológicos, carné, seguimiento, ESAVI y dashboard.
+const vaccination = require('./vaccination')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite: (...a) => targetSite(...a), requireIps, billing, inPlan: (m) => inPlan(m), getEmployees: (...a) => getEmployees(...a) })
+// Compartir carnet de vacunación y facturas por correo y WhatsApp (enlace privado con vencimiento).
+const share = require('./share')(app, { supabase, auth, h, fail, clean, canAccessSite, getSettings: () => getSettings(), billing, vaccination, hasFeature: (k) => hasFeature(k) })
+// Recordatorios de la siguiente dosis por correo y WhatsApp (tarea diaria, modo prueba).
+require('./reminders')(app, { supabase, auth, h, fail, clean, ADMIN, todayBogota, getSettings: () => getSettings(), share, TZ, hasFeature: (k) => hasFeature(k) })
+
 app.get('/citologias/datos-formulario', auth(STAFF), requireIps('citologia'), h(async (req, res) => {
   const [price, employees, last, lastSlide] = await Promise.all([
     getCytologyPrice(),
     getEmployees(await targetSite(req)),
-    supabase.from('cytology_samples').select('num_factura').order('num_factura', { ascending: false }).limit(1),
+    Promise.resolve({ data: [], error: null }),
     supabase.from('cytology_samples').select('num_lamina').order('num_lamina', { ascending: false }).limit(1)
   ])
   if (last.error) throw last.error
@@ -932,7 +1057,7 @@ app.get('/citologias/datos-formulario', auth(STAFF), requireIps('citologia'), h(
     valor: price,
     empleados: employees,
     fechaHoy: todayBogota(),
-    siguienteFactura: nextCode('FV', last.data[0]?.num_factura),
+    siguienteFactura: null, // la factura se genera en Facturación → Servicios facturables
     siguienteLamina: nextCode('L', lastSlide.data[0]?.num_lamina)
   })
 }))
@@ -958,8 +1083,9 @@ app.post('/registrar-toma-de-muestras-citologicas', auth(STAFF), requireIps('cit
   delete row.num_factura
   delete row.num_lamina
 
-  // Fecha del examen: hoy.
+  // Fecha del examen y de recibido: hoy (el día en que se registra).
   row.fecha_examen = todayBogota()
+  row.fecha_recibido = row.fecha_examen
   if (!ISO_DATE.test(row.fecha_nacimiento)) return fail(res, 'Fecha de nacimiento inválida', 400)
   if (row.fecha_nacimiento > row.fecha_examen) return fail(res, 'La fecha de nacimiento no puede ser posterior al examen', 400)
 
@@ -973,21 +1099,32 @@ app.post('/registrar-toma-de-muestras-citologicas', auth(STAFF), requireIps('cit
   if (row.email && !EMAIL_RE.test(row.email)) errors.push('El correo no es válido')
   if (row.email) row.email = row.email.toLowerCase()
 
-  // El valor sale siempre de Citologías → Configuración (no se edita en cada registro).
-  row.valor = await getCytologyPrice()
-  if (row.valor == null) return fail(res, 'Configura el valor de la citología en Citologías → Configuración', 400)
-  // Descuento opcional: se guarda el valor base, el descuento aplicado y el valor final.
-  row.valor_base = row.valor
-  if (body.discountId) {
-    const { data: d } = await supabase.from('discounts').select('*').eq('id', Number(body.discountId)).maybeSingle()
-    if (!d || !d.active) return fail(res, 'El descuento seleccionado no está disponible', 400)
-    const amount = Math.min(row.valor, d.type === 'porcentaje' ? Math.round(row.valor * Number(d.value) / 100) : Number(d.value))
-    row.discount_id = d.id; row.discount_name = d.name; row.discount_amount = amount
-    row.valor = row.valor - amount
+  // Primero se factura (Facturación → Servicios facturables) y el formulario toma esa factura por el documento de la paciente.
+  // Sin el módulo de facturación en el plan, la citología se registra sin factura y queda "por facturar".
+  row.site_id = await targetSite(req, body.siteId)
+  const tariff = await getCytologyTariff()
+  if (!tariff) return fail(res, 'Configura la tarifa de la citología en Facturación → Tarifario', 400)
+  let invoice = null
+  if (inPlan('facturacion')) {
+    if (!Number(body.invoiceId)) return fail(res, 'Primero factura la citología en Facturación → Servicios facturables y elige aquí la factura de la paciente', 400)
+    try { invoice = await billing.takeInvoice(req, { module: 'citologia', chargeId: body.invoiceId, docNumber: row.num_documento, siteId: row.site_id }) } catch (e) { return fail(res, e.message, e.status || 400) }
+  }
+  let bill
+  try { bill = await billing.resolveBilling({ entityId: body.entityId, epsId: invoice ? invoice.eps_id : body.epsId }, tariff.price) } catch (e) { return fail(res, e.message, e.status || 400) }
+  row.entity_id = bill.entity_id; row.eps_id = bill.eps_id
+  if (bill.entidad) row.entidad = bill.entidad
+  row.eps = bill.eps || null
+  if (invoice) {
+    // Los valores y la forma de pago son los de la factura.
+    Object.assign(row, {
+      num_factura: invoice.invoice_number, valor_base: invoice.unitBase, valor: invoice.unitValor, discount_id: invoice.discount_id ?? null,
+      discount_name: invoice.discount_name, discount_amount: invoice.unitDiscount || null, payment_mode: invoice.payment_mode, billing_status: invoice.billing_status, billing_id: invoice.billing_id
+    })
+  } else {
+    row.valor = tariff.price; row.valor_base = tariff.price; row.payment_mode = 'contado'; row.billing_status = 'por_facturar'
   }
 
   // Elaboró / tomó muestra deben ser empleados registrados de la sede.
-  row.site_id = await targetSite(req, body.siteId)
   const names = (await getEmployees(row.site_id)).map((e) => e.fullName)
   if (!names.includes(row.elabora)) errors.push('"Elaboró historia" debe ser un empleado registrado')
   if (!names.includes(row.toma_muestra)) errors.push('"Tomó muestra" debe ser un empleado registrado')
@@ -995,6 +1132,17 @@ app.post('/registrar-toma-de-muestras-citologicas', auth(STAFF), requireIps('cit
 
   const { data, error } = await supabase.from('cytology_samples').insert(row).select('id, num_factura, num_lamina, edad').single()
   if (error) throw error
+  if (invoice) {
+    try { await billing.linkInvoice(invoice.id, 'cytology_samples', data.id, data.num_lamina, { doc: row.num_documento, name: `${row.nombre || ''} ${row.apellidos || ''}`.trim() }) } catch (e) { console.error('No se pudo enlazar la factura', invoice.invoice_number, data.id, e.message) }
+    return res.status(201).send({ message: 'Datos registrados exitosamente', id: data.id, numFactura: data.num_factura, numLamina: data.num_lamina, edad: data.edad })
+  }
+  // Sin facturación en el plan: queda "por facturar".
+  await billing.recordCharge({
+    site_id: row.site_id, service_id: tariff.serviceId, service_name: 'Citología', source_table: 'cytology_samples', source_id: data.id,
+    service_date: row.fecha_examen, patient_name: `${row.nombre || ''} ${row.apellidos || ''}`.trim(), patient_doc: `${row.tipo_documento || ''} ${row.num_documento || ''}`.trim(),
+    reference: data.num_lamina, eps_id: row.eps_id, entity_id: row.entity_id, valor_base: tariff.price, discount_amount: 0, valor: tariff.price,
+    payment_mode: 'contado', billing_status: 'por_facturar', created_by: req.user.id
+  }, [{ tariff_id: tariff.id, name: tariff.name, quantity: 1, unit_price: tariff.price, subtotal: tariff.price }]).catch((e) => console.error('No se pudo registrar el cobro de la citología', data.id, e.message))
   res.status(201).send({ message: 'Datos registrados exitosamente', id: data.id, numFactura: data.num_factura, numLamina: data.num_lamina, edad: data.edad })
 }))
 
@@ -1077,6 +1225,26 @@ app.get('/dashboard', auth(NO_DRIVER), h(async (req, res) => {
   ])
   for (const r of [temps, cyto, cytoPrev, recent, users, lastTemp]) if (r.error) throw r.error
 
+  // Alerta de cadena de frío: última lectura de cada sede (últimos 3 días) por encima del límite → contactar al proveedor.
+  const since = new Date(Date.now() - 3 * 86400000).toISOString()
+  const recentTemps = await sc(supabase.from('temperature').select('id, recorded_at, record_date, shift, temp_min, temp_max, site_id, site:sites(name)')).gte('recorded_at', since).order('recorded_at', { ascending: false })
+  if (recentTemps.error) throw recentTemps.error
+  const latestBySite = {}
+  for (const t of recentTemps.data) if (!latestBySite[t.site_id]) latestBySite[t.site_id] = t
+  const hot = Object.values(latestBySite).filter((t) => Number(t.temp_max) > tMax)
+  const contacts = hot.length ? await coldchain.contactsBySite(hot.map((t) => t.site_id)) : {}
+  const coldChainAlerts = hot.map((t) => ({
+    siteId: t.site_id, siteName: t.site?.name ?? null, reading: toTempDTO(t), limit: tMax,
+    message: `La última lectura (${Number(t.temp_max)} °C) supera el límite de ${tMax} °C. Comunícate con el proveedor de los equipos de cadena de frío.`,
+    // Un proveedor por tarjeta, con los equipos y servicios que atiende en la sede.
+    providers: Object.values((contacts[t.site_id] || []).reduce((acc, c) => {
+      const o = acc[c.provider.id] = acc[c.provider.id] || { ...c.provider, services: [], equipment: [] }
+      if (!o.services.includes(c.serviceLabel)) o.services.push(c.serviceLabel)
+      if (!o.equipment.includes(c.equipment.name)) o.equipment.push(c.equipment.name)
+      return acc
+    }, {})).map((o) => ({ ...o, service: o.services.join(' · '), equipment: o.equipment.join(', ') }))
+  }))
+
   // --- Temperatura ---
   const series = temps.data.map((t) => {
     const dto = toTempDTO(t)
@@ -1114,6 +1282,7 @@ app.get('/dashboard', auth(NO_DRIVER), h(async (req, res) => {
     siteId: site,
     today,
     thresholds: { min: tMin, max: tMax },
+    coldChainAlerts,
     temperature: {
       series,
       alerts,
@@ -1162,6 +1331,8 @@ require('./inventory')(app, { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_
 require('./equipment')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 require('./talento')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
 require('./estandares')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
+// Calidad IPS · Documentos generales (ítems principales y carpetas hasta 3 niveles).
+require('./calidad')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite })
 const plt = platform.register(app, { supabase, auth, h, fail, clean, JWT_SECRET, ISO_DATE, MODULE_KEYS })
 legal = require('./legal')(app, { supabase, auth, h, fail, clean, ADMIN, platform: plt, pauth: plt.pauth })
 require('./search')(app, { supabase, auth, h, fail, clean, userModules, ...SCOPE })

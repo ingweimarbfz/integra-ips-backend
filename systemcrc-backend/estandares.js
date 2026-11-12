@@ -4,6 +4,7 @@
 // Archivos PDF, imágenes, Word y Excel con nombre, categoría, versión y observaciones.
 // =====================================================================
 const crypto = require('crypto')
+const { htmlFields } = require('./htmldoc')
 
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite } = deps
@@ -22,7 +23,8 @@ module.exports = (app, deps) => {
   const TYPES = {
     'application/pdf': 'pdf', 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp',
     'application/msword': 'doc', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
-    'application/vnd.ms-excel': 'xls', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx'
+    'application/vnd.ms-excel': 'xls', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+    'text/html': 'html'
   }
   const httpError = (status, message) => Object.assign(new Error(message), { status })
   const hx = (fn) => h(async (req, res) => { try { await fn(req, res) } catch (e) { if (e.status) return fail(res, e.message, e.status); throw e } })
@@ -30,7 +32,7 @@ module.exports = (app, deps) => {
 
   const upload = async (standard, file) => {
     const m = /^data:([a-z0-9/+.-]+);base64,(.+)$/i.exec(file?.data || '')
-    if (!m || !TYPES[m[1]]) throw httpError(400, 'Tipo de archivo no permitido. Carga PDF, imágenes (PNG, JPG), Word o Excel.')
+    if (!m || !TYPES[m[1]] || m[1] === 'text/html') throw httpError(400, 'Tipo de archivo no permitido. Carga PDF, imágenes (PNG, JPG), Word o Excel.')
     const buffer = Buffer.from(m[2], 'base64')
     if (buffer.length > MAX) throw httpError(400, 'El archivo supera 15 MB')
     const path = `${standard}/${crypto.randomBytes(10).toString('hex')}.${TYPES[m[1]]}`
@@ -49,6 +51,7 @@ module.exports = (app, deps) => {
     id: d.id, standard: d.standard, siteId: d.site_id, siteName: d.site?.name ?? null, name: d.name, category: d.category, code: d.code, version: d.version,
     observations: d.observations, requiredId: d.required_id, requiredName: d.required?.name ?? null, requiredCode: d.required?.code ?? null,
     validUntil: d.valid_until, validity: validity(d.valid_until), daysLeft: d.valid_until ? daysUntil(d.valid_until) : null, fileUrl: d.file_url, fileName: d.file_name, fileType: d.file_type, fileExt: TYPES[d.file_type], fileSize: d.file_size,
+      description: d.description ?? null, isHtml: d.file_type === 'text/html', contentHtml: d.content_html ?? null,
     createdBy: d.creator ? `${d.creator.name} ${d.creator.last_name}` : null, createdById: d.created_by, updatedBy: d.editor ? `${d.editor.name} ${d.editor.last_name}` : null,
     createdAt: d.created_at, updatedAt: d.updated_at
   })
@@ -57,7 +60,7 @@ module.exports = (app, deps) => {
     if (!name) throw httpError(400, 'El nombre del documento es requerido')
     const until = clean(b.validUntil)
     if (until && !ISO_DATE.test(until)) throw httpError(400, 'Fecha de vigencia inválida')
-    return { name: name.slice(0, 200), category: clean(b.category), code: clean(b.code), version: clean(b.version), observations: clean(b.observations), required_id: Number(b.requiredId) || null, valid_until: until }
+    return { name: name.slice(0, 200), category: clean(b.category), code: clean(b.code), version: clean(b.version), observations: clean(b.observations), description: clean(b.description), required_id: Number(b.requiredId) || null, valid_until: until }
   }
   const load = async (req) => {
     const { data, error } = await supabase.from('std_documents').select(SELECT).eq('id', Number(req.params.id)).eq('standard', standardOf(req)).maybeSingle()
@@ -87,15 +90,16 @@ module.exports = (app, deps) => {
     let rows = data.map(dto)
     const text = clean(req.query.q)?.toLowerCase()
     if (text) rows = rows.filter((d) => [d.name, d.code, d.category, d.observations, d.fileName].some((v) => v && v.toLowerCase().includes(text)))
-    if (clean(req.query.tipo)) rows = rows.filter((d) => ({ pdf: ['pdf'], imagen: ['png', 'jpg', 'webp'], word: ['doc', 'docx'], excel: ['xls', 'xlsx'] }[req.query.tipo] || []).includes(d.fileExt))
+    if (clean(req.query.tipo)) rows = rows.filter((d) => ({ pdf: ['pdf'], imagen: ['png', 'jpg', 'webp'], word: ['doc', 'docx'], excel: ['xls', 'xlsx'], html: ['html'] }[req.query.tipo] || []).includes(d.fileExt))
     res.send(rows)
   }))
 
   app.post('/estandares/documentos/:standard', auth(STAFF), hx(async (req, res) => {
     const s = standardOf(req)
     const r = row(req.body || {})
-    if (!req.body?.file) return fail(res, 'Carga el archivo del documento', 400)
-    const f = await upload(s, req.body.file)
+    const isHtml = req.body?.kind === 'html'
+    if (!isHtml && !req.body?.file) return fail(res, 'Carga el archivo del documento', 400)
+    const f = isHtml ? htmlFields(r.name, req.body.contentHtml, httpError) : await upload(s, req.body.file)
     const { data, error } = await supabase.from('std_documents').insert({ ...r, ...f, standard: s, site_id: siteFor(req, req.body.siteId), created_by: req.user.id, updated_by: req.user.id }).select(SELECT).single()
     if (error) { await remove(f.file_path); throw error }
     res.status(201).send(dto(data))
@@ -106,7 +110,7 @@ module.exports = (app, deps) => {
     const upd = { ...row(req.body || {}), updated_by: req.user.id, updated_at: new Date().toISOString() }
     if (req.user.role === 'administrador' && 'siteId' in (req.body || {})) upd.site_id = siteFor(req, req.body.siteId)
     let f = null
-    if (req.body?.file) { f = await upload(cur.standard, req.body.file); Object.assign(upd, f) }
+    if (cur.file_type === 'text/html') { if ('contentHtml' in (req.body || {})) Object.assign(upd, htmlFields(upd.name, req.body.contentHtml, httpError)) } else if (req.body?.file) { f = await upload(cur.standard, req.body.file); Object.assign(upd, f) }
     const { data, error } = await supabase.from('std_documents').update(upd).eq('id', cur.id).select(SELECT).single()
     if (error) { if (f) await remove(f.file_path); throw error }
     if (f) await remove(cur.file_path)
@@ -151,7 +155,7 @@ module.exports = (app, deps) => {
       const own = docs.filter((d) => d.requiredId === r.id)
       const valid = own.filter((d) => d.validity !== 'vencido')
       const status = !own.length ? 'faltante' : !valid.length ? 'vencido' : valid.some((d) => d.validity !== 'por_vencer') ? 'cumple' : 'por_vencer'
-      return { ...reqDTO(r), status, documents: own.map((d) => ({ id: d.id, name: d.name, fileName: d.fileName, fileUrl: d.fileUrl, fileExt: d.fileExt, validUntil: d.validUntil, validity: d.validity, daysLeft: d.daysLeft, siteName: d.siteName })) }
+      return { ...reqDTO(r), status, documents: own.map((d) => ({ id: d.id, name: d.name, fileName: d.fileName, fileUrl: d.fileUrl, fileExt: d.fileExt, isHtml: d.isHtml, contentHtml: d.contentHtml, validUntil: d.validUntil, validity: d.validity, daysLeft: d.daysLeft, siteName: d.siteName })) }
     })
   }
   app.get('/estandares/documentos/:standard/carpeta', auth(STAFF), hx(async (req, res) => {
