@@ -5,6 +5,8 @@ const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
 const crypto = require('crypto')
 const { createClient } = require('@supabase/supabase-js')
+const compression = require('compression')
+const { pageQuery, setTotal } = require('./paging')
 const platform = require('./platform')
 let legal = null // documentos legales: se registra más abajo
 // Rutas permitidas mientras el contrato y el acuerdo de datos no estén firmados.
@@ -45,7 +47,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
 
 const app = express()
 // CORS_ORIGIN admite varios orígenes separados por coma (p. ej. localhost y la URL pública del frontend).
-app.use(cors({ origin: CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean) }))
+app.use(cors({ origin: CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean), exposedHeaders: ['X-Total-Count'] }))
+// Respuestas comprimidas (gzip/deflate): los JSON grandes viajan 70–80 % más livianos.
+app.use(compression({ threshold: 1024 }))
 app.use(express.json({ limit: '25mb' })) // imágenes en base64 (foto de perfil y logo)
 
 const TZ = 'America/Bogota'
@@ -1156,16 +1160,16 @@ app.get('/consultar-citologias', auth(STAFF), requireIps('citologia'), h(async (
 
   let query = applyScope(supabase
     .from('cytology_samples')
-    .select('id, fecha_examen, num_lamina, num_factura, nombre, apellidos, tipo_documento, num_documento, edad, eps, entidad, regimen'), scopeSite(req))
+    .select('id, fecha_examen, num_lamina, num_factura, nombre, apellidos, tipo_documento, num_documento, edad, eps, entidad, regimen', { count: 'exact' }), scopeSite(req))
     .order('fecha_examen', { ascending: false })
     .order('id', { ascending: false })
-    .limit(200)
   if (desde) query = query.gte('fecha_examen', desde)
   if (hasta) query = query.lte('fecha_examen', hasta)
   if (documento) query = query.ilike('num_documento', `%${documento.replace(/[%_\\]/g, '')}%`)
 
-  const { data, error } = await query
+  const { data, error, count } = await pageQuery(req, query, 200)
   if (error) throw error
+  setTotal(res, count)
   res.send(data.map(toCamel))
 }))
 
