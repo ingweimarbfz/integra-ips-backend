@@ -5,6 +5,10 @@ const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
 const crypto = require('crypto')
 const { createClient } = require('@supabase/supabase-js')
+const platform = require('./platform')
+let legal = null // documentos legales: se registra más abajo
+// Rutas permitidas mientras el contrato y el acuerdo de datos no estén firmados.
+const LEGAL_ALLOW = ['/auth/me', '/legal', '/firma', '/configuracion', '/plan', '/perfil']
 
 const {
   SUPABASE_URL, SUPABASE_SECRET_KEY, JWT_SECRET,
@@ -23,7 +27,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
 const app = express()
 // CORS_ORIGIN admite varios orígenes separados por coma (p. ej. localhost y la URL pública del frontend).
 app.use(cors({ origin: CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean) }))
-app.use(express.json({ limit: '20mb' })) // imágenes en base64 (foto de perfil y logo)
+app.use(express.json({ limit: '25mb' })) // imágenes en base64 (foto de perfil y logo)
 
 const TZ = 'America/Bogota'
 const TZ_OFFSET = '-05:00' // Colombia no tiene horario de verano
@@ -40,20 +44,22 @@ const IPS_MODULES = ['cadena_frio', 'citologia', 'ambulancias'] // módulos del 
 // Módulos por usuario: el administrador puede mostrar u ocultar módulos a cada usuario.
 // users.modules = null usa los del rol; un arreglo los reemplaza. El administrador ve todo.
 // ======================================================================
-const MODULE_KEYS = ['ips_dashboard', 'citologias', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano']
+const MODULE_KEYS = ['ips_dashboard', 'citologias', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica']
 const ROLE_MODULES = {
-  empleado: ['ips_dashboard', 'citologias', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano'],
+  empleado: ['ips_dashboard', 'citologias', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica'],
   voluntario: ['socorro', 'educacion', 'voluntario'],
   conductor: ['flota', 'traslado'],
   administrador: MODULE_KEYS
 }
-const userModules = (u) => (u.role === 'administrador' ? MODULE_KEYS : Array.isArray(u.modules) ? u.modules.filter((m) => MODULE_KEYS.includes(m)) : ROLE_MODULES[u.role] || [])
+// El plan contratado (plataforma) limita los módulos de todos, incluido el administrador.
+const inPlan = (m) => !platform.state.modules || platform.state.modules.includes(m)
+const userModules = (u) => (u.role === 'administrador' ? MODULE_KEYS : Array.isArray(u.modules) ? u.modules.filter((m) => MODULE_KEYS.includes(m)) : ROLE_MODULES[u.role] || []).filter(inPlan)
 // Ruta → módulo (el primero que coincide). Las rutas sin módulo solo dependen del rol.
 const ROUTE_MODULES = [
   ['/citologias', ['citologias']], ['/registrar-toma-de-muestras-citologicas', ['citologias']], ['/consultar-citologias', ['citologias']],
   ['/registrar-temperatura', ['temperatura']], ['/reporte-temperatura', ['temperatura']], ['/temperatura', ['temperatura']],
   ['/ambulancias-dashboard', ['traslado']], ['/equipos', ['equipos']], ['/dashboard', ['ips_dashboard']],
-  ['/estandares/th', ['talento_humano']], ['/socorro/dashboard', ['og_dashboard']], ['/socorro/reporte-voluntarios', ['reporte_voluntarios']], ['/socorro/eventos', ['socorro', 'educacion']], ['/socorro/inventario', ['socorro', 'educacion']],
+  ['/estandares/th', ['talento_humano']], ['/estandares/documentos/procesos_prioritarios', ['procesos_prioritarios']], ['/estandares/documentos/interdependencia', ['interdependencia']], ['/estandares/documentos/medicamentos', ['medicamentos']], ['/estandares/documentos/infraestructura', ['infraestructura']], ['/estandares/documentos/historia_clinica', ['historia_clinica']], ['/socorro/dashboard', ['og_dashboard']], ['/socorro/reporte-voluntarios', ['reporte_voluntarios']], ['/socorro/eventos', ['socorro', 'educacion']], ['/socorro/inventario', ['socorro', 'educacion']],
   ['/socorro/personas', ['personas', 'socorro', 'educacion']], ['/inventario', ['inventario']], ['/voluntario/panel', ['voluntario']],
   ['/vehiculos', ['flota', 'traslado']]
 ]
@@ -105,6 +111,7 @@ const toUserDTO = (u) => ({
   siteId: u.site_id,
   site: u.site ? siteDTO(u.site) : null,
   modules: userModules(u),
+  plan: platform.state.plan ? { name: platform.state.plan.name, code: platform.state.plan.code, modules: platform.state.modules } : null,
   customModules: Array.isArray(u.modules) ? u.modules : null
 })
 
@@ -173,6 +180,11 @@ const auth = (roles = ALL) => async (req, res, next) => {
     if (user.role !== 'administrador' && user.site && !user.site.active) return fail(res, 'Tu sede está inactiva. Contacta al administrador.', 401)
     // Permisos: rol del endpoint + módulos del usuario.
     const mods = routeModules(req.path)
+    if (mods && !mods.some(inPlan)) return fail(res, 'Tu plan no incluye este módulo. Consulta las opciones de plan con el proveedor.', 403)
+    if (legal && !LEGAL_ALLOW.some((p) => req.path === p || req.path.startsWith(`${p}/`))) {
+      const st = await legal.current()
+      if (st.pending) return fail(res, 'El servicio está pendiente de activación: el administrador debe firmar el contrato y el acuerdo de tratamiento de datos.', 423)
+    }
     if (user.role !== 'administrador' && mods) {
       const own = userModules(user)
       const has = mods.some((m) => own.includes(m))
@@ -188,7 +200,7 @@ const auth = (roles = ALL) => async (req, res, next) => {
   }
 }
 
-app.get('/', (req, res) => res.send('API SystemCRC (Supabase)'))
+app.get('/', (req, res) => res.send('API Integra IPS (Supabase)'))
 
 app.post('/login', h(async (req, res) => {
   const { userName, password } = req.body || {}
@@ -693,6 +705,9 @@ const getSettings = async () => {
     primaryColor: s.primary_color,
     secondaryColor: s.secondary_color,
     logoUrl: s.logo_url,
+    loginImageUrl: s.login_image_url,
+    loginDescription: s.login_description,
+    loginFooter: s.login_footer,
     tempMinThreshold: Number(cold.temp_min),
     tempMaxThreshold: Number(cold.temp_max),
     cytologyPrice: price,
@@ -703,7 +718,7 @@ const getSettings = async () => {
 // Público: el login necesita el nombre, los colores y el logo antes de iniciar sesión.
 app.get('/configuracion/publica', h(async (req, res) => {
   const s = await getSettings()
-  res.send({ ipsName: s.ipsName, shortName: s.shortName, primaryColor: s.primaryColor, secondaryColor: s.secondaryColor, logoUrl: s.logoUrl })
+  res.send({ ipsName: s.ipsName, shortName: s.shortName, primaryColor: s.primaryColor, secondaryColor: s.secondaryColor, logoUrl: s.logoUrl, loginImageUrl: s.loginImageUrl, loginDescription: s.loginDescription, loginFooter: s.loginFooter })
 }))
 
 app.get('/configuracion', auth(), h(async (req, res) => res.send(await getSettings())))
@@ -720,6 +735,8 @@ app.put('/configuracion', auth(ADMIN), h(async (req, res) => {
   const { error } = await supabase.from('app_settings').update({
     ips_name: clean(b.ipsName), short_name: clean(b.shortName),
     primary_color: b.primaryColor.toUpperCase(), secondary_color: b.secondaryColor.toUpperCase(),
+    ...('loginDescription' in b ? { login_description: clean(b.loginDescription)?.slice(0, 600) ?? null } : {}),
+    ...('loginFooter' in b ? { login_footer: clean(b.loginFooter)?.slice(0, 200) ?? null } : {}),
     updated_at: new Date().toISOString()
   }).eq('id', 1)
   if (error) throw error
@@ -733,6 +750,24 @@ app.post('/configuracion/logo', auth(ADMIN), h(async (req, res) => {
   const { error } = await supabase.from('app_settings').update({ logo_url: url, updated_at: new Date().toISOString() }).eq('id', 1)
   if (error) throw error
   await removeStoredFile('branding', before.logoUrl)
+  res.send(await getSettings())
+}))
+
+// Imagen de fondo del inicio de sesión (configurable por la IPS).
+app.post('/configuracion/login-imagen', auth(ADMIN), h(async (req, res) => {
+  const before = await getSettings()
+  const url = await uploadImage('branding', 'login', req.body?.image, ['image/png', 'image/jpeg', 'image/webp'])
+  if (!url) return fail(res, 'Imagen inválida (PNG, JPG o WEBP de máximo 2 MB)', 400)
+  const { error } = await supabase.from('app_settings').update({ login_image_url: url, updated_at: new Date().toISOString() }).eq('id', 1)
+  if (error) throw error
+  await removeStoredFile('branding', before.loginImageUrl)
+  res.send(await getSettings())
+}))
+app.delete('/configuracion/login-imagen', auth(ADMIN), h(async (req, res) => {
+  const before = await getSettings()
+  const { error } = await supabase.from('app_settings').update({ login_image_url: null, updated_at: new Date().toISOString() }).eq('id', 1)
+  if (error) throw error
+  await removeStoredFile('branding', before.loginImageUrl)
   res.send(await getSettings())
 }))
 
@@ -1126,6 +1161,10 @@ require('./inspections')(app, { supabase, auth, h, fail, clean, ISO_DATE, TZ, TZ
 require('./inventory')(app, { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ_OFFSET, todayBogota, ...SCOPE })
 require('./equipment')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 require('./talento')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
+require('./estandares')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
+const plt = platform.register(app, { supabase, auth, h, fail, clean, JWT_SECRET, ISO_DATE, MODULE_KEYS })
+legal = require('./legal')(app, { supabase, auth, h, fail, clean, ADMIN, platform: plt, pauth: plt.pauth })
+require('./search')(app, { supabase, auth, h, fail, clean, userModules, ...SCOPE })
 require('./signatures')(app, { supabase, auth, h, fail, clean, ADMIN, uploadImage, removeStoredFile, canAccessSite })
 require('./vehicles')(app, { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 

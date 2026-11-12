@@ -118,6 +118,12 @@ module.exports = (app, deps) => {
       siteOf(req, c.staff.site_id)
       if (slot === 'verifica') { if (c.reviewer_id !== req.user.id) throw httpError(403, 'Solo quien realizó la verificación puede firmar esta casilla') } else if (slot === 'profesional') { if (!isStaffSelf(c.staff, req.user)) throw httpError(403, `Solo ${c.staff.first_name} ${c.staff.last_name} puede firmar esta casilla`) } else if (slot === 'coordinacion') { if (!STAFF.includes(req.user.role)) throw httpError(403, 'La casilla Revisó la firma la coordinación') } else throw httpError(400, 'Casilla de firma inválida')
     },
+    // Verificación de carpeta obligatoria de un estándar (p. ej. interdependencia): Verificó y Revisó.
+    std_chequeo: async (req, key, slot) => {
+      const c = await loadOne('std_checklists', 'id, site_id, reviewer_id', key)
+      siteOf(req, c.site_id)
+      if (slot === 'verifica') { if (c.reviewer_id !== req.user.id) throw httpError(403, 'Solo quien realizó la verificación puede firmar esta casilla') } else if (slot === 'revisa') { if (!STAFF.includes(req.user.role)) throw httpError(403, 'La casilla Revisó la firma la coordinación') } else throw httpError(400, 'Casilla de firma inválida')
+    },
     th_hoja_vida: async (req, key, slot) => {
       const s = await loadOne('th_staff', 'id, site_id, user_id, document, first_name, last_name', key)
       siteOf(req, s.site_id)
@@ -154,22 +160,23 @@ module.exports = (app, deps) => {
   // ---------------------------------------------------------------- Pendientes por firmar del usuario
   // Solo las casillas que tienen un firmante definido: el profesional de la citología, el coordinador del evento,
   // el conductor del reporte/preoperacional y, para el administrador, el "Revisó" de flota (últimos 30 días).
-  const SLOT_LABELS = { elabora: 'Elaboró historia', toma_muestra: 'Tomó la muestra', coordinador: 'Coordinador', conductor: 'Conductor', reviso: 'Revisó', persona: 'Salida de personal', verifica: 'Verificó', profesional: 'Profesional', coordinacion: 'Revisó' }
+  const SLOT_LABELS = { elabora: 'Elaboró historia', toma_muestra: 'Tomó la muestra', coordinador: 'Coordinador', conductor: 'Conductor', reviso: 'Revisó', persona: 'Salida de personal', verifica: 'Verificó', profesional: 'Profesional', coordinacion: 'Revisó', revisa: 'Revisó' }
   const pendingFor = async (user) => {
     const name = norm(fullName(user))
     const since = new Date(Date.now() - 30 * 86400000).toISOString()
     const admin = user.role === 'administrador'
-    const [cyto, events, trips, insp, signed, thc] = await Promise.all([
+    const [cyto, events, trips, insp, signed, thc, stc] = await Promise.all([
       ['administrador', 'empleado'].includes(user.role) ? supabase.from('cytology_samples').select('id, num_factura, nombre, apellidos, fecha_examen, elabora, toma_muestra').order('fecha_examen', { ascending: false }).limit(500) : { data: [] },
       supabase.from('gso_events').select('id, code, name, area, ended_at, status, coordinator:volunteers!gso_events_coordinator_id_fkey(document)').eq('status', 'finalizado').order('ended_at', { ascending: false }).limit(300),
       admin ? supabase.from('vehicle_trips').select('id, code, activity, driver_id, status, ended_at, vehicles(movil)').eq('status', 'cerrado').gte('ended_at', since).order('ended_at', { ascending: false })
         : supabase.from('vehicle_trips').select('id, code, activity, driver_id, status, ended_at, vehicles(movil)').eq('driver_id', user.id).eq('status', 'cerrado').order('ended_at', { ascending: false }).limit(100),
       admin ? supabase.from('vehicle_inspections').select('id, code, driver_id, inspected_at, result, vehicles(movil)').gte('inspected_at', since).order('inspected_at', { ascending: false })
         : supabase.from('vehicle_inspections').select('id, code, driver_id, inspected_at, result, vehicles(movil)').eq('driver_id', user.id).order('inspected_at', { ascending: false }).limit(100),
-      supabase.from('document_signatures').select('doc_type, doc_key, slot').in('doc_type', ['citologia', 'evento', 'reporte_vehiculo', 'preoperacional', 'th_chequeo']),
-      supabase.from('th_checklists').select('id, code, check_date, result, reviewer_id, staff:th_staff(id, user_id, document, first_name, last_name)').order('check_date', { ascending: false }).limit(300)
+      supabase.from('document_signatures').select('doc_type, doc_key, slot').in('doc_type', ['citologia', 'evento', 'reporte_vehiculo', 'preoperacional', 'th_chequeo', 'std_chequeo']),
+      supabase.from('th_checklists').select('id, code, check_date, result, reviewer_id, staff:th_staff(id, user_id, document, first_name, last_name)').order('check_date', { ascending: false }).limit(300),
+      supabase.from('std_checklists').select('id, kind, code, standard, check_date, result, site:sites(name)').eq('reviewer_id', user.id).order('check_date', { ascending: false }).limit(100)
     ])
-    for (const r of [cyto, events, trips, insp, signed, thc]) if (r.error) throw r.error
+    for (const r of [cyto, events, trips, insp, signed, thc, stc]) if (r.error) throw r.error
     const done = new Set(signed.data.map((x) => `${x.doc_type}|${x.doc_key}|${x.slot}`))
     const out = []
     const add = (o) => { if (!done.has(`${o.docType}|${o.docKey}|${o.slot}`)) out.push({ ...o, slotLabel: SLOT_LABELS[o.slotKind || o.slot] }) }
@@ -209,6 +216,9 @@ module.exports = (app, deps) => {
       const base = { docType: 'th_chequeo', docKey: String(c.id), title: `Lista de chequeo ${c.code}`, subtitle: `${c.staff.first_name} ${c.staff.last_name} · ${c.result === 'cumple' ? 'Cumple' : 'No cumple'}`, date: c.check_date, link: `/estandares/talento-humano/chequeo/${c.id}` }
       if (c.reviewer_id === user.id) add({ ...base, slot: 'verifica' })
     }
+    const STD_ROUTE = { interdependencia: 'interdependencia', procesos_prioritarios: 'procesos-prioritarios', medicamentos: 'medicamentos', infraestructura: 'infraestructura', historia_clinica: 'historia-clinica' }
+    const STD_LABEL = { interdependencia: 'Interdependencia', procesos_prioritarios: 'Procesos prioritarios', medicamentos: 'Medicamentos y dispositivos', infraestructura: 'Infraestructura', historia_clinica: 'Historia clínica' }
+    for (const c of stc.data) add({ docType: 'std_chequeo', docKey: String(c.id), slot: 'verifica', title: `${c.kind === 'seguimiento' ? 'Seguimiento' : 'Verificación de carpeta'} ${c.code}`, subtitle: `${STD_LABEL[c.standard] || c.standard} · ${c.site?.name || 'General'} · ${c.result === 'cumple' ? 'Cumple' : 'No cumple'}`, date: c.check_date, link: `/estandares/${STD_ROUTE[c.standard] || c.standard}/${c.kind === 'seguimiento' ? 'seguimiento' : 'verificacion'}/${c.id}` })
     return out.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))
   }
 
