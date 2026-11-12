@@ -6,6 +6,7 @@
 //   (pago inmediato en caja o cuenta de cobro a la EPS).
 // · Cuentas de cobro: agrupan las citologías pendientes de cobro por EPS.
 // =====================================================================
+const { pageQuery, setTotal } = require('./paging')
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite } = deps
   const STAFF = ['administrador', 'empleado']
@@ -394,7 +395,7 @@ module.exports = (app, deps) => {
     res.send(data.map((x) => ({ id: x.id, name: x.name, module: x.module, form: FORM_SERVICES[x.module] || null, tariffs: (tariffs.data || []).filter((t) => t.service_id === x.id).map(tariffDTO) })))
   }))
   app.get('/facturacion/servicios', auth(STAFF), hx(async (req, res) => {
-    let q = supabase.from('service_charges').select(CHARGE_SELECT).order('service_date', { ascending: false }).order('id', { ascending: false }).limit(300)
+    let q = supabase.from('service_charges').select(CHARGE_SELECT, { count: 'exact' }).order('service_date', { ascending: false }).order('id', { ascending: false })
     const site = scopeSite(req)
     if (site) q = q.eq('site_id', site)
     if (req.query.estado === 'por_facturar') q = q.eq('billing_status', 'por_facturar')
@@ -403,8 +404,11 @@ module.exports = (app, deps) => {
       if (ISO_DATE.test(req.query.hasta || '')) q = q.lte('service_date', req.query.hasta)
     }
     if (Number(req.query.servicio)) q = q.eq('service_id', Number(req.query.servicio))
-    const { data, error } = await q
+    if (req.query.estado === 'facturados') q = q.neq('billing_status', 'por_facturar')
+    // Sin ?pagina la pantalla trae el periodo completo (hasta 1.000) para que los totales cuadren.
+    const { data, error, count } = await pageQuery(req, q, 1000)
     if (error) throw error
+    setTotal(res, count)
     res.send(data.map(chargeDTO))
   }))
   // Registrar y facturar un servicio (ítems del tarifario, convenio, forma de pago y descuento).

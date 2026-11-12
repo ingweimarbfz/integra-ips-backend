@@ -8,6 +8,7 @@
 // Educación y Socorro; los eventos consumen de la bodega de su sede.
 // Lo que sale de una bodega de unidad o grupo no regresa a la bodega general.
 // =====================================================================
+const { pageQuery, setTotal } = require('./paging')
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ_OFFSET, todayBogota, scopeSite, canAccessSite } = deps
 
@@ -450,8 +451,8 @@ module.exports = (app, deps) => {
     const desde = clean(req.query.desde); const hasta = clean(req.query.hasta)
     if ((desde && !ISO_DATE.test(desde)) || (hasta && !ISO_DATE.test(hasta))) return fail(res, 'Fechas inválidas', 400)
     let q = supabase.from('inventory_movements')
-      .select('id, type, quantity, stock_after, note, created_at, transfer_ref, destination, users(name, last_name), counterpart:warehouses!inventory_movements_counterpart_warehouse_id_fkey(name), gso_events(id, code, name), item:inventory_items!inner(id, name, code, category, unit, lot, site_id, warehouse_id, product_id, site:sites(name), warehouse:warehouses(name))')
-      .order('created_at', { ascending: false }).limit(Math.min(Number(req.query.limite) || 300, 1000))
+      .select('id, type, quantity, stock_after, note, created_at, transfer_ref, destination, users(name, last_name), counterpart:warehouses!inventory_movements_counterpart_warehouse_id_fkey(name), gso_events(id, code, name), item:inventory_items!inner(id, name, code, category, unit, lot, site_id, warehouse_id, product_id, site:sites(name), warehouse:warehouses(name))', { count: 'exact' })
+      .order('created_at', { ascending: false })
     if (v.warehouse) q = q.eq('item.warehouse_id', v.warehouse)
     else if (v.site) q = q.eq('item.site_id', v.site)
     if (Number(req.query.item)) q = q.eq('item_id', Number(req.query.item))
@@ -460,8 +461,9 @@ module.exports = (app, deps) => {
     if (MOVE_LABELS[req.query.tipo]) q = q.eq('type', req.query.tipo)
     if (desde) q = q.gte('created_at', `${desde}T00:00:00${TZ_OFFSET}`)
     if (hasta) q = q.lte('created_at', `${hasta}T23:59:59${TZ_OFFSET}`)
-    const { data, error } = await q
+    const { data, error, count } = await pageQuery(req, q, Math.min(Number(req.query.limite) || 300, 1000))
     if (error) throw error
+    setTotal(res, count)
     const dests = await allDestinations()
     res.send(data.map((m) => movementDTO(m, dests)))
   }))

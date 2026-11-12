@@ -3,6 +3,7 @@
 // Personas (voluntarios), inventario con stock, eventos con personal,
 // materiales (salen y regresan) e insumos (se consumen y descuentan stock).
 // =====================================================================
+const { pageQuery, setTotal } = require('./paging')
 module.exports = (app, deps) => {
   const { userModules } = deps
   const { supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, scopeSite, applyScope, canAccessSite, targetSite } = deps
@@ -302,8 +303,8 @@ module.exports = (app, deps) => {
     const desde = clean(req.query.desde); const hasta = clean(req.query.hasta)
     if ((desde && !ISO_DATE.test(desde)) || (hasta && !ISO_DATE.test(hasta))) return fail(res, 'Fechas inválidas', 400)
     let query = applyScope(supabase.from('gso_events')
-      .select('id, code, name, place, area, status, started_at, ended_at, site_id, site:sites(name), coordinator:volunteers!gso_events_coordinator_id_fkey(first_name, last_name, carnet), gso_event_personnel(count), gso_event_supplies(count), gso_event_materials(count)'), scopeSite(req))
-      .order('started_at', { ascending: false }).limit(300)
+      .select('id, code, name, place, area, status, started_at, ended_at, site_id, site:sites(name), coordinator:volunteers!gso_events_coordinator_id_fkey(first_name, last_name, carnet), gso_event_personnel(count), gso_event_supplies(count), gso_event_materials(count)', { count: 'exact' }), scopeSite(req))
+      .order('started_at', { ascending: false })
     if (estado) query = query.eq('status', estado)
     const allowed = areasOf(req.user)
     if (AREAS.includes(req.query.area)) {
@@ -313,7 +314,8 @@ module.exports = (app, deps) => {
     if (desde) query = query.gte('started_at', `${desde}T00:00:00${TZ_OFFSET}`)
     if (hasta) query = query.lte('started_at', `${hasta}T23:59:59${TZ_OFFSET}`)
     if (q) { const s = q.replace(/[%_,()]/g, ''); query = query.or(`name.ilike.%${s}%,place.ilike.%${s}%,code.ilike.%${s}%`) }
-    const { data, error } = await query
+    const { data, error, count } = await pageQuery(req, query, 300)
+    if (!error) setTotal(res, count)
     if (error) throw error
     res.send(data.map((e) => ({
       id: e.id, code: e.code, name: e.name, place: e.place, area: e.area, status: e.status, startedAt: e.started_at, endedAt: e.ended_at,

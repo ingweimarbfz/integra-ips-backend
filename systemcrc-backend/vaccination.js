@@ -7,6 +7,7 @@
 // · Vacunas que se cobran: se factura primero (Facturación → Servicios facturables) y el registro toma la factura.
 // · Carné, seguimiento de dosis (próximas y atrasadas), ESAVI, exportación para PAIWEB y dashboard.
 // =====================================================================
+const { pageQuery, setTotal } = require('./paging')
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, requireIps, billing, inPlan, getEmployees } = deps
   const STAFF = ['administrador', 'empleado']
@@ -252,7 +253,7 @@ module.exports = (app, deps) => {
 
   // ---------------------------------------------------------------- Consulta, carné y exportación
   app.get('/vacunacion/registros', ...gate, hx(async (req, res) => {
-    let q = supabase.from('vaccination_records').select(RECORD_SELECT).order('applied_on', { ascending: false }).order('id', { ascending: false }).limit(500)
+    let q = supabase.from('vaccination_records').select(RECORD_SELECT, { count: 'exact' }).order('applied_on', { ascending: false }).order('id', { ascending: false })
     const site = scopeSite(req)
     if (site) q = q.eq('site_id', site)
     const doc = String(req.query.documento || '').replace(/[^\dA-Za-z]/g, '')
@@ -262,8 +263,9 @@ module.exports = (app, deps) => {
       if (ISO_DATE.test(req.query.hasta || '')) q = q.lte('applied_on', req.query.hasta)
     }
     if (Number(req.query.biologico)) q = q.eq('vaccine_id', Number(req.query.biologico))
-    const { data, error } = await q
+    const { data, error, count } = await pageQuery(req, q, 500)
     if (error) throw error
+    setTotal(res, count)
     res.send(data.map(recordDTO))
   }))
   app.get('/vacunacion/carne/:documento', ...gate, hx(async (req, res) => {
