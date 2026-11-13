@@ -4,6 +4,7 @@
 // materiales (salen y regresan) e insumos (se consumen y descuentan stock).
 // =====================================================================
 const { pageQuery, setTotal } = require('./paging')
+const V = require('./validate')
 const tenant = require('./tenant')
 module.exports = (app, deps) => {
   const { userModules } = deps
@@ -99,14 +100,15 @@ module.exports = (app, deps) => {
     for (const k of ['joinedAt', 'insuranceExpiry']) if (clean(b[k]) && !ISO_DATE.test(b[k])) errors.push('Fecha inválida')
     if (!clean(b.firstName) || !clean(b.lastName)) errors.push('Nombres y apellidos son requeridos')
     if (b.bloodType && !BLOOD.includes(b.bloodType)) errors.push('Grupo sanguíneo inválido')
-    if (clean(b.phone) && !PHONE_RE.test(clean(b.phone))) errors.push('El celular debe tener 10 dígitos')
+    if (V.digits(b.phone) && !V.PHONE_RE.test(V.digits(b.phone))) errors.push('El celular debe tener 10 dígitos')
+    { const m = V.docError(b.document, null); if (m) errors.push(m) }
     if (clean(b.email) && !EMAIL_RE.test(clean(b.email))) errors.push('Correo no válido')
     return errors
   }
   const volunteerRow = (b) => ({
     document: clean(b.document), carnet: clean(b.carnet)?.toUpperCase() ?? null,
     first_name: clean(b.firstName), last_name: clean(b.lastName), blood_type: b.bloodType || null,
-    agrupacion: clean(b.agrupacion), phone: clean(b.phone), email: clean(b.email)?.toLowerCase() ?? null,
+    agrupacion: clean(b.agrupacion), phone: V.phone(b.phone), email: clean(b.email)?.toLowerCase() ?? null,
     active: b.active !== false, volunteer_type: b.volunteerType || 'base', joined_at: clean(b.joinedAt) || todayBogota(),
     insurance_entity: clean(b.insuranceEntity), insurance_policy: clean(b.insurancePolicy), insurance_expiry: clean(b.insuranceExpiry),
     updated_at: new Date().toISOString()

@@ -8,6 +8,7 @@
 // · Carné, seguimiento de dosis (próximas y atrasadas), ESAVI, exportación para PAIWEB y dashboard.
 // =====================================================================
 const { pageQuery, setTotal } = require('./paging')
+const V = require('./validate')
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, requireIps, billing, inPlan, getEmployees } = deps
   const STAFF = ['administrador', 'empleado']
@@ -152,7 +153,7 @@ module.exports = (app, deps) => {
     if (!ISO_DATE.test(b.birthDate || '') || b.birthDate > today()) e.push('Fecha de nacimiento inválida')
     if (b.sex && !SEX.includes(b.sex)) e.push('Sexo inválido')
     if (b.modality && !MODALITIES[b.modality]) e.push('Modalidad inválida')
-    if (clean(b.phone) && !/^\d{7,10}$/.test(clean(b.phone))) e.push('El teléfono debe tener entre 7 y 10 dígitos')
+    for (const m of [V.phoneError(b.phone, 'El celular'), V.emailError(b.email), V.docError(doc, b.docType)]) if (m) e.push(m)
     const { data: v } = await supabase.from('vaccines').select('*').eq('id', Number(b.vaccineId)).maybeSingle()
     if (!v || !v.active) e.push('Elige el biológico')
     if (e.length) return fail(res, e.join('. '), 400)
@@ -218,7 +219,7 @@ module.exports = (app, deps) => {
     const applied = today()
     const row = {
       site_id: site, applied_on: applied, patient_doc_type: clean(b.docType), patient_doc_number: doc, names: clean(b.names), surnames: clean(b.surnames), birth_date: b.birthDate,
-      sex: b.sex || null, phone: clean(b.phone), email: clean(b.email)?.toLowerCase() ?? null, address: clean(b.address), municipality: clean(b.municipality),
+      sex: b.sex || null, phone: V.phone(b.phone), email: clean(b.email)?.toLowerCase() ?? null, address: clean(b.address), municipality: clean(b.municipality),
       eps_id: Number(b.epsId) || null, regimen: clean(b.regimen), population_group: GROUPS.includes(b.populationGroup) ? b.populationGroup : 'Población general', ethnicity: clean(b.ethnicity),
       vaccine_id: v.id, dose_label: dose, dose_index: doseIndex, lot: item?.lot ?? clean(b.lot), expiry_date: item?.expiry_date ?? null, item_id: item?.id ?? null, vial_id: vialId,
       modality: b.modality || 'intramural', vaccinator_id: vaccinator.id, vaccinator: vaccinator.fullName, charge_id: invoice?.id ?? null,

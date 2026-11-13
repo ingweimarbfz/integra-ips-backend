@@ -7,6 +7,7 @@
 // · Cuentas de cobro: agrupan las citologías pendientes de cobro por EPS.
 // =====================================================================
 const { pageQuery, setTotal } = require('./paging')
+const V = require('./validate')
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite } = deps
   const STAFF = ['administrador', 'empleado']
@@ -35,9 +36,9 @@ module.exports = (app, deps) => {
     const cats = (Array.isArray(b.categories) ? b.categories : []).filter((c) => CATEGORIES.includes(c))
     if (!cats.length) e.push('Elige al menos una categoría')
     if (clean(b.email) && !/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(clean(b.email))) e.push('Correo inválido')
-    if (clean(b.phone) && !/^[\d\s+()-]{7,20}$/.test(clean(b.phone))) e.push('Teléfono inválido')
+    for (const m of [V.phoneError(b.phone), V.nitError(b.nit)]) if (m) e.push(m)
     if (e.length) throw httpError(400, e.join('. '))
-    return { name: clean(b.name), nit: clean(b.nit), description: clean(b.description), active: b.active !== false, categories: [...new Set(cats)], contact_name: clean(b.contactName), phone: clean(b.phone), email: clean(b.email)?.toLowerCase() ?? null, address: clean(b.address), city: clean(b.city), updated_at: new Date().toISOString() }
+    return { name: clean(b.name), nit: V.nit(b.nit), description: clean(b.description), active: b.active !== false, categories: [...new Set(cats)], contact_name: clean(b.contactName), phone: V.phone(b.phone), email: clean(b.email)?.toLowerCase() ?? null, address: clean(b.address), city: clean(b.city), updated_at: new Date().toISOString() }
   }
   app.post('/proveedores', auth(ADMIN), hx(async (req, res) => {
     const { data, error } = await supabase.from('ips_entities').insert(entRow(req.body || {})).select('*').single()
@@ -82,11 +83,12 @@ module.exports = (app, deps) => {
     if (clean(b.agreementValidUntil) && !ISO_DATE.test(b.agreementValidUntil)) e.push('Vigencia inválida')
     if (clean(b.billingEmail) && !/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(clean(b.billingEmail))) e.push('Correo inválido')
     if (b.kind && !ENTITY_KINDS.includes(b.kind)) e.push('Tipo de entidad inválido')
+    { const m = V.nitError(b.nit); if (m) e.push(m) }
     if (b.stampsPct != null && b.stampsPct !== '' && (Number.isNaN(Number(b.stampsPct)) || Number(b.stampsPct) < 0 || Number(b.stampsPct) > 20)) e.push('Porcentaje de estampillas inválido')
     if (e.length) throw httpError(400, e.join('. '))
     const has = Boolean(b.hasAgreement)
     return {
-      name: clean(b.name), nit: clean(b.nit), code: clean(b.code), regimen: b.regimen || null, active: b.active !== false, has_agreement: has,
+      name: clean(b.name), nit: V.nit(b.nit), code: clean(b.code), regimen: b.regimen || null, active: b.active !== false, has_agreement: has,
       payment_mode: has ? (b.paymentMode || 'contado') : 'contado', discount_id: has ? Number(b.discountId) || null : null, discount_enabled: b.discountEnabled !== false,
       agreement_number: has ? clean(b.agreementNumber) : null, agreement_valid_until: has ? clean(b.agreementValidUntil) : null,
       billing_contact: clean(b.billingContact), billing_email: clean(b.billingEmail)?.toLowerCase() ?? null, notes: clean(b.notes), updated_at: new Date().toISOString(),
@@ -423,6 +425,7 @@ module.exports = (app, deps) => {
     // Quién paga: el mismo paciente, otra persona o una empresa. El paciente puede quedar sin definir (se define en el formulario).
     const payerType = ['paciente', 'tercero', 'empresa'].includes(b.payerType) ? b.payerType : 'paciente'
     const payerName = clean(b.payerName); const payerDoc = clean(String(b.payerDocNumber || '').replace(/[^\dA-Za-z]/g, ''))
+    for (const m of [V.phoneError(b.payerPhone, 'El teléfono de quien paga'), V.emailError(b.payerEmail, 'El correo de quien paga'), V.docError(docNumber, clean(b.docType)), payerType === 'empresa' ? V.nitError(payerDoc, 'El NIT de la empresa') : V.docError(payerDoc, clean(b.payerDocType), 'El documento de quien paga')]) if (m) e.push(m)
     if (payerType === 'paciente') {
       if (!names) e.push('Escribe los nombres del paciente')
       if (svc && FORM_SERVICES[svc.module] && !docNumber) e.push('Escribe el número de documento del paciente: con él se enlaza la factura al formulario')
@@ -446,7 +449,7 @@ module.exports = (app, deps) => {
     const id = await recordCharge({
       site_id: siteId, service_id: svc.id, service_name: svc.name, service_date: b.date, form_units: units,
       payer_type: payerType, payer_name: payerType === 'paciente' ? patientName : payerName, payer_doc_type: payerType === 'paciente' ? clean(b.docType) : clean(b.payerDocType),
-      payer_doc_number: payerType === 'paciente' ? docNumber : payerDoc, payer_phone: clean(b.payerPhone), payer_email: clean(b.payerEmail)?.toLowerCase() ?? null,
+      payer_doc_number: payerType === 'paciente' ? docNumber : payerDoc, payer_phone: V.phone(b.payerPhone), payer_email: clean(b.payerEmail)?.toLowerCase() ?? null,
       patient_name: patientName || (payerType === 'paciente' ? null : `Por definir · ${payerName}`), patient_names: names, patient_surnames: surnames,
       patient_doc_type: clean(b.docType), patient_doc_number: docNumber, patient_doc: docNumber ? [clean(b.docType), docNumber].filter(Boolean).join(' ') : clean(b.patientDoc),
       description: clean(b.description), reference: clean(b.reference), invoice_number: invoice, invoiced_at: new Date().toISOString(), eps_id: bill.eps_id, entity_id: bill.entity_id,

@@ -4,6 +4,7 @@
 // que el sistema muestra y permite usar (también para el administrador).
 // =====================================================================
 const jwt = require('jsonwebtoken')
+const V = require('./validate')
 const bcrypt = require('bcryptjs')
 
 const tenant = require('./tenant')
@@ -195,6 +196,7 @@ const register = (app, deps) => {
     if (!['prueba', 'activa', 'suspendida', 'cancelada'].includes(b.status)) e.push('Estado inválido')
     for (const d of [b.startDate, b.renewalDate]) if (clean(d) && !ISO_DATE.test(d)) e.push('Fecha inválida')
     if (clean(b.contactEmail) && !/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(clean(b.contactEmail))) e.push('Correo inválido')
+    for (const m of [V.phoneError(b.contactPhone), V.nitError(b.nit)]) if (m) e.push(m)
     if (Number(b.planId)) {
       const { data: p } = await supabase.from('plt_plans').select('audience, name').eq('id', Number(b.planId)).maybeSingle()
       if (!p) e.push('Plan inválido')
@@ -203,8 +205,8 @@ const register = (app, deps) => {
     if (e.length) throw httpError(400, e.join('. '))
     const valid = new Set((await loadFeatures()).map((f) => f.key))
     return {
-      name: clean(b.name), nit: clean(b.nit), org_type: b.orgType, city: clean(b.city), contact_name: clean(b.contactName), contact_email: clean(b.contactEmail)?.toLowerCase() ?? null,
-      contact_phone: clean(b.contactPhone), plan_id: Number(b.planId) || null, billing_cycle: b.billingCycle, status: b.status, start_date: clean(b.startDate), renewal_date: clean(b.renewalDate),
+      name: clean(b.name), nit: V.nit(b.nit), org_type: b.orgType, city: clean(b.city), contact_name: clean(b.contactName), contact_email: clean(b.contactEmail)?.toLowerCase() ?? null,
+      contact_phone: V.phone(b.contactPhone), plan_id: Number(b.planId) || null, billing_cycle: b.billingCycle, status: b.status, start_date: clean(b.startDate), renewal_date: clean(b.renewalDate),
       extra_features: (b.extraFeatures || []).filter((k) => valid.has(k)), notes: clean(b.notes), updated_at: new Date().toISOString()
     }
   }
@@ -240,6 +242,7 @@ const register = (app, deps) => {
     const b = req.body || {}
     const e = []
     for (const [k, l] of [['siteName', 'Nombre de la sede'], ['municipality', 'Municipio'], ['adminName', 'Nombre del administrador'], ['adminLastName', 'Apellidos'], ['adminIdentification', 'Identificación'], ['adminUsername', 'Usuario']]) if (!clean(b[k])) e.push(`${l} es requerido`)
+    { const m = V.docError(b.adminIdentification, null, 'La identificación'); if (m) e.push(m) }
     if (!b.adminPassword || String(b.adminPassword).length < 8) e.push('La contraseña debe tener al menos 8 caracteres')
     if (clean(b.adminEmail) && !/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(clean(b.adminEmail))) e.push('Correo inválido')
     if (e.length) return fail(res, e.join('. '), 400)
@@ -319,12 +322,15 @@ const register = (app, deps) => {
     const b = req.body || {}
     const { data: plan } = await supabase.from('plt_plans').select('id, audience, active').eq('id', Number(b.planId)).maybeSingle()
     if (!plan || !plan.active) return fail(res, 'Plan inválido', 400)
+    // El teléfono es el medio por el que se contacta al cliente: 10 dígitos (celular o fijo de Colombia).
+    const contactPhone = String(b.contactPhone || '').replace(/\D/g, '')
+    if (!/^\d{10}$/.test(contactPhone)) return fail(res, 'Escribe un teléfono de contacto de 10 dígitos.', 400)
     if (plan.audience === 'esal' && org.org_type !== 'esal') return fail(res, 'Ese plan es solo para entidades sin ánimo de lucro', 400)
     const { data: open } = await supabase.from('plt_upgrade_requests').select('id').eq('organization_id', org.id).in('status', ['pendiente', 'contactado']).maybeSingle()
     if (open) return fail(res, 'Ya tienes una solicitud en curso. Te contactaremos pronto.', 409)
     const { error } = await supabase.from('plt_upgrade_requests').insert({
       organization_id: org.id, from_plan_id: org.plan_id, to_plan_id: plan.id, billing_cycle: b.billingCycle === 'anual' ? 'anual' : 'mensual',
-      message: clean(b.message)?.slice(0, 1000) ?? null, contact_phone: clean(b.contactPhone), requested_by: req.user.id
+      message: clean(b.message)?.slice(0, 1000) ?? null, contact_phone: contactPhone, requested_by: req.user.id
     })
     if (error) throw error
     res.status(201).send({ ok: true })
