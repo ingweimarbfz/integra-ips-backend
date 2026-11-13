@@ -504,7 +504,7 @@ module.exports = (app, deps) => {
     }
     const trip = tripDTO(await loadTrip(data.id))
     res.status(201).send(trip)
-    deps.notify?.('vehicular', deps.notifyMsg().viaje(trip, 'iniciada'))
+    deps.notify?.('vehicular', deps.notifyMsg().viaje(trip, 'iniciada'), v.site_id)
   }))
 
   // Cerrar: km de llegada (tacómetro), foto del tacómetro, combustible y foto del ticket.
@@ -541,7 +541,7 @@ module.exports = (app, deps) => {
     await supabase.from('vehicles').update({ current_km: kmIn, updated_at: new Date().toISOString() }).eq('id', t.vehicle_id)
     const closedTrip = tripDTO(await loadTrip(t.id))
     res.send(closedTrip)
-    deps.notify?.('vehicular', deps.notifyMsg().viaje(closedTrip, 'cerrada'))
+    deps.notify?.('vehicular', deps.notifyMsg().viaje(closedTrip, 'cerrada'), t.site_id)
   }))
 
   app.put('/vehiculos-reportes/:id', auth(TRIP_ROLES), hx(async (req, res) => {

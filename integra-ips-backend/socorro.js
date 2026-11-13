@@ -355,7 +355,7 @@ module.exports = (app, deps) => {
     }
     const created = eventDTO(await loadEvent(data.id), req.user)
     res.status(201).send(created)
-    deps.notify?.(created.area === 'educacion' ? 'educacion' : 'socorro', deps.notifyMsg().evento(created, 'abierto'))
+    deps.notify?.(created.area === 'educacion' ? 'educacion' : 'socorro', deps.notifyMsg().evento(created, 'abierto'), created.siteId)
   }))
 
   app.get('/socorro/eventos/:id', auth(EVENTS), hx(async (req, res) => {
@@ -597,7 +597,7 @@ module.exports = (app, deps) => {
     if (error) throw error
     const closed = eventDTO(await loadEvent(event.id), req.user)
     res.send(closed)
-    deps.notify?.(closed.area === 'educacion' ? 'educacion' : 'socorro', deps.notifyMsg().evento(closed, 'finalizado'))
+    deps.notify?.(closed.area === 'educacion' ? 'educacion' : 'socorro', deps.notifyMsg().evento(closed, 'finalizado'), closed.siteId)
   }))
 
   // ================================================================ Panel del voluntario

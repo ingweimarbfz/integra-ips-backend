@@ -141,7 +141,7 @@ module.exports = (app, deps) => {
       const { data } = await supabase.from('vehicle_inspections').select(SELECT).eq('id', ins.id).single()
       const created = dto(data)
       res.status(201).send(created)
-      deps.notify?.('vehicular', deps.notifyMsg().preoperacional(created))
+      deps.notify?.('vehicular', deps.notifyMsg().preoperacional(created), data.site_id)
     } catch (e) {
       for (const u of uploaded) await removeStoredFile('vehicles', u)
       if (e.status) return fail(res, e.message, e.status)

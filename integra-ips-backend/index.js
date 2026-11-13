@@ -969,7 +969,7 @@ app.post('/registrar-temperatura', auth(STAFF), requireIps('cadena_frio'), h(asy
   // Aviso por Telegram (en segundo plano): sede, lectura y si quedó fuera de rango.
   ;(async () => {
     const [{ data: site }, cold] = await Promise.all([supabase.from('sites').select('name').eq('id', siteId).maybeSingle(), serviceSettings('cadena_frio')])
-    notifier.notify('temperatura', notifier.messages.temperatura({ ...dto, siteName: site?.name }, { min: Number(cold.temp_min), max: Number(cold.temp_max) }))
+    notifier.notify('temperatura', notifier.messages.temperatura({ ...dto, siteName: site?.name }, { min: Number(cold.temp_min), max: Number(cold.temp_max) }), siteId)
   })().catch((e) => console.error('Aviso de temperatura:', e.message))
 }))
 

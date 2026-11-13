@@ -2,6 +2,7 @@
 // Notificaciones por Telegram
 // · Cada organización configura su bot (token de @BotFather) y uno o más grupos por sección.
 // · Secciones: temperatura, eventos y emergencias (socorro), vehicular (actividad y preoperacional) y educación.
+// · Cada grupo pertenece a una sede: solo recibe los avisos de esa sede (sin sede = todas, para la dirección).
 // · Una sección solo se puede configurar y notificar si su módulo está en el plan de la organización.
 // · El envío nunca bloquea ni hace fallar el registro que lo origina (se ejecuta en segundo plano).
 // =====================================================================
@@ -32,18 +33,20 @@ module.exports = (app, deps) => {
   const sectionsDTO = () => Object.entries(SECTIONS).map(([key, s]) => ({ key, label: s.label, hint: s.hint, module: s.module, available: inPlan(s.module) }))
 
   // Envío (en segundo plano, en el contexto de la organización de la petición).
-  const send = async (section, html) => {
+  const send = async (section, html, siteId) => {
     if (!SECTIONS[section] || !featureOn() || !inPlan(SECTIONS[section].module)) return
     const st = await loadSettings()
     if (!st?.enabled || !st.bot_token) return
-    const { data: chans } = await supabase.from('notification_channels').select('chat_id, title').eq('section', section).eq('enabled', true)
+    let q = supabase.from('notification_channels').select('chat_id, title, site_id').eq('section', section).eq('enabled', true)
+    q = siteId ? q.or(`site_id.is.null,site_id.eq.${Number(siteId)}`) : q.is('site_id', null)
+    const { data: chans } = await q
     for (const c of chans || []) {
       let status = 'enviado'; let detail = null
       try { await tg(st.bot_token, 'sendMessage', { chat_id: c.chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: true }) } catch (e) { status = 'error'; detail = e.message.slice(0, 300) }
-      await supabase.from('notification_log').insert({ section, chat_id: c.chat_id, status, detail })
+      await supabase.from('notification_log').insert({ section, chat_id: c.chat_id, status, detail, site_id: siteId || null })
     }
   }
-  const notify = (section, html) => { send(section, html).catch((e) => console.error('Telegram:', e.message)) }
+  const notify = (section, html, siteId) => { send(section, html, siteId).catch((e) => console.error('Telegram:', e.message)) }
   const when = (iso) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'medium', timeStyle: 'short', timeZone: TZ }).format(iso ? new Date(iso) : new Date())
 
   // Mensajes de cada evento del sistema.
@@ -69,13 +72,17 @@ module.exports = (app, deps) => {
   // ---------------------------------------------------------------- Configuración (administrador)
   app.get('/notificaciones', auth(ADMIN), gate, hx(async (req, res) => {
     const st = await loadSettings()
-    const { data: chans } = await supabase.from('notification_channels').select('*').order('section').order('id')
+    const [{ data: chans }, { data: sites }] = await Promise.all([
+      supabase.from('notification_channels').select('*, site:sites(name)').order('section').order('id'),
+      supabase.from('sites').select('id, name, active').order('name')
+    ])
     const { data: log } = await supabase.from('notification_log').select('*').order('created_at', { ascending: false }).limit(15)
     res.send({
       bot: { configured: Boolean(st?.bot_token), tokenMasked: mask(st?.bot_token), username: st?.bot_username || null, name: st?.bot_name || null, enabled: Boolean(st?.enabled) },
       sections: sectionsDTO(),
-      channels: (chans || []).map((c) => ({ id: c.id, section: c.section, chatId: c.chat_id, title: c.title, enabled: c.enabled, available: Boolean(SECTIONS[c.section] && inPlan(SECTIONS[c.section].module)) })),
-      log: (log || []).map((l) => ({ id: l.id, section: l.section, chatId: l.chat_id, status: l.status, detail: l.detail, createdAt: l.created_at }))
+      sites: (sites || []).filter((x) => x.active !== false).map((x) => ({ id: x.id, name: x.name })),
+      channels: (chans || []).map((c) => ({ id: c.id, section: c.section, siteId: c.site_id, siteName: c.site?.name ?? null, chatId: c.chat_id, title: c.title, enabled: c.enabled, available: Boolean(SECTIONS[c.section] && inPlan(SECTIONS[c.section].module)) })),
+      log: (log || []).map((l) => ({ id: l.id, section: l.section, siteId: l.site_id, chatId: l.chat_id, status: l.status, detail: l.detail, createdAt: l.created_at }))
     })
   }))
   // Guardar el bot: valida el token con Telegram (getMe). Si no se envía token, solo cambia el interruptor.
@@ -114,8 +121,14 @@ module.exports = (app, deps) => {
     if (!inPlan(SECTIONS[b.section].module)) return fail(res, `Tu plan no incluye el módulo de ${SECTIONS[b.section].label}`, 403)
     const chatId = String(b.chatId || '').trim()
     if (!/^-?\d{5,20}$/.test(chatId)) return fail(res, 'Grupo inválido', 400)
-    const { data, error } = await supabase.from('notification_channels').insert({ section: b.section, chat_id: chatId, title: clean(b.title)?.slice(0, 120) ?? null }).select('*').single()
-    if (error) { if (error.code === '23505') return fail(res, 'Ese grupo ya está asignado a esta sección', 409); throw error }
+    let siteId = null
+    if (b.siteId && b.siteId !== 'todas') {
+      const { data: site } = await supabase.from('sites').select('id').eq('id', Number(b.siteId)).maybeSingle()
+      if (!site) return fail(res, 'Sede inválida', 400)
+      siteId = site.id
+    }
+    const { data, error } = await supabase.from('notification_channels').insert({ section: b.section, site_id: siteId, chat_id: chatId, title: clean(b.title)?.slice(0, 120) ?? null }).select('*').single()
+    if (error) { if (error.code === '23505') return fail(res, 'Ese grupo ya está asignado a esta sección y sede', 409); throw error }
     res.status(201).send({ id: data.id })
   }))
   app.put('/notificaciones/canales/:id', auth(ADMIN), gate, hx(async (req, res) => {
