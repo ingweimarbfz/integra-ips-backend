@@ -1360,7 +1360,7 @@ require('./socorro')(app, { userModules, notify: (...a) => notifier.notify(...a)
 require('./inspections')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, supabase, auth, h, fail, clean, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 // Módulo de vehículos (flota)
 // Módulo IPS: hoja de vida de equipos
-require('./inventory')(app, { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ_OFFSET, todayBogota, ...SCOPE })
+require('./inventory')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ_OFFSET, todayBogota, ...SCOPE })
 require('./equipment')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 require('./talento')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
 require('./estandares')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })

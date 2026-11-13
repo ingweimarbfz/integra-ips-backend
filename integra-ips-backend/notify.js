@@ -12,7 +12,9 @@ module.exports = (app, deps) => {
     temperatura: { label: 'Registro de temperatura', module: 'temperatura', hint: 'Cada lectura registrada y las que quedan fuera de rango' },
     socorro: { label: 'Eventos y emergencias', module: 'socorro', hint: 'Apertura y cierre de eventos y emergencias' },
     vehicular: { label: 'Vehicular', module: 'flota', hint: 'Actividad vehicular (salida y cierre) y preoperacional' },
-    educacion: { label: 'Actividades de educación', module: 'educacion', hint: 'Apertura y cierre de actividades de educación' }
+    educacion: { label: 'Actividades de educación', module: 'educacion', hint: 'Apertura y cierre de actividades de educación' },
+    ambulancias: { label: 'Ambulancias (traslado asistencial)', module: 'traslado', hint: 'Salida y llegada de cada traslado asistencial TAB/TAM' },
+    inventario: { label: 'Inventario y bodegas', module: 'inventario', hint: 'Ingresos a la bodega general, traslados entre bodegas, entregas, bajas y ajustes' }
   }
   const API = 'https://api.telegram.org'
   const httpError = (status, message) => Object.assign(new Error(message), { status })
@@ -64,6 +66,16 @@ module.exports = (app, deps) => {
     viaje: (t, accion) => `🚑 <b>Actividad vehicular ${accion}</b>\n${esc(t.code)} · Móvil ${esc(t.vehicle?.movil || '—')} (${esc(t.vehicle?.plate || '')})\n` +
       `Conductor: ${esc(t.driver?.name || '—')}\nActividad: ${esc(t.activity || '—')}${t.event ? `\nEvento: ${esc(t.event.code)} · ${esc(t.event.name)}` : ''}\n` +
       (accion === 'cerrada' ? `Km: ${t.kmOut} → ${t.kmIn ?? '—'} (${t.kmDiff ?? '—'} km)\n${when(t.endedAt)}` : `Km de salida: ${t.kmOut}\n${when(t.startedAt)}`),
+    // Traslado asistencial: sin datos clínicos ni documento del paciente (solo iniciales), por protección de datos.
+    traslado: (t, accion) => {
+      const x = t.transfer || {}
+      const ini = String(x.patientName || '').split(/\s+/).filter(Boolean).map((w) => `${w[0].toUpperCase()}.`).join(' ')
+      return `🚑 <b>Traslado asistencial ${accion}</b>\n${esc(t.code)} · Móvil ${esc(t.vehicle?.movil || '—')} (${esc(t.vehicle?.vehicleType || '')})\n` +
+        `Paciente: ${esc(ini || '—')} · Prioridad: ${esc(x.priority || '—')}\n${esc(x.origin || '—')} → ${esc(x.destination || '—')}\n` +
+        `Conductor: ${esc(t.driver?.name || '—')}\n` + (accion === 'finalizado' ? `Km: ${t.kmOut} → ${t.kmIn ?? '—'}\n${when(t.endedAt)}` : when(t.startedAt))
+    },
+    inventario: (title, lines, foot) => `📦 <b>${esc(title)}</b>\n` + lines.slice(0, 15).map((l) => `• ${esc(l)}`).join('\n') +
+      (lines.length > 15 ? `\n… y ${lines.length - 15} más` : '') + (foot ? `\n${esc(foot)}` : '') + `\n${when()}`,
     preoperacional: (r) => `${r.result === 'no_apto' || (r.anomalies || 0) > 0 ? '⚠️' : '✅'} <b>Preoperacional</b> ${esc(r.code)}\n` +
       `Móvil ${esc(r.vehicle?.movil || '—')} (${esc(r.vehicle?.plate || '')}) · ${esc(r.siteName || '')}\nConductor: ${esc(r.driver?.name || '—')}\n` +
       `Resultado: <b>${esc(r.result || '—')}</b>${r.anomalies ? ` · ${r.anomalies} novedad${r.anomalies === 1 ? '' : 'es'}` : ''}\nKm: ${r.km}\n${when(r.inspectedAt)}`
