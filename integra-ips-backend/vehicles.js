@@ -502,7 +502,10 @@ module.exports = (app, deps) => {
       const { error: tErr } = await supabase.from('vehicle_transfers').insert({ ...transfer, trip_id: data.id })
       if (tErr) { await supabase.from('vehicle_trips').delete().eq('id', data.id); throw tErr }
     }
-    res.status(201).send(tripDTO(await loadTrip(data.id)))
+    const trip = tripDTO(await loadTrip(data.id))
+    res.status(201).send(trip)
+    if (trip.transfer) deps.notify?.('ambulancias', deps.notifyMsg().traslado(trip, 'iniciado'), v.site_id)
+    else deps.notify?.('vehicular', deps.notifyMsg().viaje(trip, 'iniciada'), v.site_id)
   }))
 
   // Cerrar: km de llegada (tacómetro), foto del tacómetro, combustible y foto del ticket.
@@ -537,7 +540,10 @@ module.exports = (app, deps) => {
     if (error) throw error
     // El km de llegada pasa a ser el km actual del vehículo.
     await supabase.from('vehicles').update({ current_km: kmIn, updated_at: new Date().toISOString() }).eq('id', t.vehicle_id)
-    res.send(tripDTO(await loadTrip(t.id)))
+    const closedTrip = tripDTO(await loadTrip(t.id))
+    res.send(closedTrip)
+    if (closedTrip.transfer) deps.notify?.('ambulancias', deps.notifyMsg().traslado(closedTrip, 'finalizado'), t.site_id)
+    else deps.notify?.('vehicular', deps.notifyMsg().viaje(closedTrip, 'cerrada'), t.site_id)
   }))
 
   app.put('/vehiculos-reportes/:id', auth(TRIP_ROLES), hx(async (req, res) => {

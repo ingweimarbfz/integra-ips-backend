@@ -352,6 +352,7 @@ module.exports = (app, deps) => {
     const { error } = await supabase.rpc('inv_move', { p_item: line.id, p_delta: qty, p_type: 'entrada', p_user: req.user.id, p_note: note, p_destination: null, p_event: null })
     if (error) throw rpcError(error)
     res.status(201).send((await loadLines({ productId: p.id, warehouse: general.id })).find((l) => l.id === line.id))
+    deps.notify?.('inventario', deps.notifyMsg().inventario('Ingreso a la bodega general', [`${p.name}${lot ? ` · lote ${lot}` : ''}: +${qty} ${p.unit || ''}`], `${general.name} · ${clean(b.supplier) ? `Proveedor: ${clean(b.supplier)} · ` : ''}Registró: ${req.user.name} ${req.user.last_name}`), general.site_id)
   }))
 
   // ---------------------------------------------------------------- Traslados (solo admin)
@@ -386,6 +387,8 @@ module.exports = (app, deps) => {
       if (e) throw rpcError(e)
     }
     res.status(201).send({ ref, toWarehouseId: to.id, warehouseName: to.name, items: items.length })
+    const trLines = items.map((it) => { const s = (src || []).find((x) => x.id === it.itemId); return `${s?.name || 'Elemento'}${s?.lot ? ` · lote ${s.lot}` : ''}: ${it.quantity}` })
+    deps.notify?.('inventario', deps.notifyMsg().inventario(`Traslado ${ref}`, trLines, `${from.name} → ${to.name} · Registró: ${req.user.name} ${req.user.last_name}`), to.site_id)
   }))
 
   // ---------------------------------------------------------------- Entregas semanales a servicios de IPS, Educación o Socorro
@@ -416,6 +419,8 @@ module.exports = (app, deps) => {
       if (e) throw rpcError(e)
     }
     res.status(201).send({ ref, destination: destinationLabel(b.destination, dests), items: items.length })
+    const enLines = items.map((it) => { const s = (src || []).find((x) => x.id === it.itemId); return `${s?.name || 'Elemento'}${s?.lot ? ` · lote ${s.lot}` : ''}: ${it.quantity}` })
+    deps.notify?.('inventario', deps.notifyMsg().inventario(`Entrega ${ref} a ${destinationLabel(b.destination, dests)}`, enLines, `${w.name}${clean(b.receivedBy) ? ` · Recibe: ${clean(b.receivedBy)}` : ''} · Registró: ${req.user.name} ${req.user.last_name}`), w.site_id)
   }))
 
   // ---------------------------------------------------------------- Bajas (vencidos, averiados, pérdidas) y ajustes: solo admin
@@ -426,11 +431,12 @@ module.exports = (app, deps) => {
     const reason = clean(b.reason)
     if (!reason) return fail(res, 'Indica el motivo', 400)
     if (Number.isNaN(qty) || qty === 0 || (type === 'baja' && qty < 0)) return fail(res, 'Cantidad inválida', 400)
-    const { data: line } = await supabase.from('inventory_items').select('id').eq('id', Number(b.itemId)).maybeSingle()
+    const { data: line } = await supabase.from('inventory_items').select('id, name, lot, unit, site_id, warehouse:warehouses(name)').eq('id', Number(b.itemId)).maybeSingle()
     if (!line) return fail(res, 'Elemento no encontrado', 404)
     const { error } = await supabase.rpc('inv_move', { p_item: line.id, p_delta: type === 'baja' ? -qty : qty, p_type: type, p_user: req.user.id, p_note: reason, p_destination: null, p_event: null })
     if (error) throw rpcError(error)
     res.status(201).send({ message: type === 'baja' ? 'Baja registrada' : 'Ajuste registrado' })
+    deps.notify?.('inventario', deps.notifyMsg().inventario(type === 'baja' ? 'Baja de inventario' : 'Ajuste de inventario', [`${line.name}${line.lot ? ` · lote ${line.lot}` : ''}: ${type === 'baja' ? -qty : (qty > 0 ? `+${qty}` : qty)} ${line.unit || ''}`], `${line.warehouse?.name || ''} · Motivo: ${reason} · Registró: ${req.user.name} ${req.user.last_name}`), line.site_id)
   }))
 
   // ---------------------------------------------------------------- Kárdex
