@@ -3,6 +3,8 @@
 // Hoja de vida (solo administrador), documentos con vencimiento (SOAT…),
 // mantenimientos con repuestos, reportes diarios del conductor y dashboard.
 // =====================================================================
+const V = require('./validate')
+
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, scopeSite, applyScope, canAccessSite, targetSite } = deps
 
@@ -82,15 +84,14 @@ module.exports = (app, deps) => {
     if (x.sex && !['F', 'M', 'I'].includes(x.sex)) e.push('Sexo inválido')
     if (x.patientCondition && !['estable', 'inestable', 'critico'].includes(x.patientCondition)) e.push('Condición del paciente inválida')
     const age = num(x.ageYears); if (age !== null && (!Number.isInteger(age) || age < 0 || age > 120)) e.push('Edad inválida')
-    if (clean(x.phone) && !/^[0-9]{7,10}$/.test(clean(x.phone))) e.push('Teléfono del paciente inválido')
-    if (clean(x.companionPhone) && !/^[0-9]{7,10}$/.test(clean(x.companionPhone))) e.push('Teléfono del acompañante inválido')
+    for (const m of [V.phoneError(x.phone, 'El teléfono del paciente'), V.phoneError(x.companionPhone, 'El teléfono del acompañante'), V.docError(x.document, x.documentType)]) if (m) e.push(m)
     return e
   }
   const transferRow = (x) => ({
     patient_name: clean(x.patientName), document_type: x.documentType, document: clean(x.document).replace(/\s+/g, ''), sex: x.sex || null,
-    age_years: num(x.ageYears), phone: clean(x.phone), eps: clean(x.eps), regime: x.regime, transfer_type: x.transferType, priority: x.priority,
+    age_years: num(x.ageYears), phone: V.phone(x.phone), eps: clean(x.eps), regime: x.regime, transfer_type: x.transferType, priority: x.priority,
     origin: clean(x.origin), destination: clean(x.destination), diagnosis: clean(x.diagnosis), patient_condition: x.patientCondition || null,
-    companion_name: clean(x.companionName), companion_phone: clean(x.companionPhone), authorization_number: clean(x.authorizationNumber),
+    companion_name: clean(x.companionName), companion_phone: V.phone(x.companionPhone), authorization_number: clean(x.authorizationNumber),
     receiving_professional: clean(x.receivingProfessional), notes: clean(x.notes)
   })
   const TRIP_SELECT = '*, vehicle_transfers(*), vehicles(id, movil, plate, vehicle_type, brand, line), driver:users!vehicle_trips_driver_id_fkey(id, name, last_name, identification), gso_events(id, code, name, status)'
@@ -151,6 +152,7 @@ module.exports = (app, deps) => {
     const e = []
     if (!clean(b.movil)) e.push('El número de móvil es requerido')
     if (!clean(b.plate)) e.push('La placa es requerida')
+    else { const m = V.plateError(b.plate); if (m) e.push(m) }
     if (!clean(b.vehicleType)) e.push('El tipo de vehículo es requerido')
     const y = num(b.modelYear); if (y !== null && (Number.isNaN(y) || y < 1950 || y > 2100)) e.push('Año inválido')
     const km = num(b.initialKm); if (!isNum(km) || km < 0) e.push('Kilometraje inicial inválido')

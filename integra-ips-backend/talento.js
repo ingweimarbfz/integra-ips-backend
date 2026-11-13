@@ -5,6 +5,7 @@
 // verificación, alertas y dashboard. Genérico para cualquier IPS.
 // =====================================================================
 const crypto = require('crypto')
+const V = require('./validate')
 
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite } = deps
@@ -273,7 +274,7 @@ module.exports = (app, deps) => {
     if (!clean(b.document)) e.push('El documento es requerido')
     if (!clean(b.firstName) || !clean(b.lastName)) e.push('Nombres y apellidos son requeridos')
     if (b.documentType && !DOC_TYPES.includes(b.documentType)) e.push('Tipo de documento inválido')
-    if (clean(b.phone) && !/^[0-9]{7,10}$/.test(clean(b.phone))) e.push('Teléfono inválido')
+    for (const m of [V.phoneError(b.phone), V.phoneError(b.emergencyPhone, 'El teléfono del contacto de emergencia'), V.docError(b.document, b.documentType || 'CC')]) if (m) e.push(m)
     if (clean(b.email) && !/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(clean(b.email))) e.push('Correo inválido')
     const year = num(b.graduationYear)
     if (year != null && (!Number.isInteger(year) || year < 1950 || year > 2100)) e.push('Año de graduación inválido')
@@ -281,10 +282,10 @@ module.exports = (app, deps) => {
     const status = STAFF_STATUS[b.status] ? b.status : (b.active === false ? 'inactivo' : 'activo')
     return {
       document_type: b.documentType || 'CC', document: clean(b.document).replace(/\s+/g, ''), first_name: clean(b.firstName), last_name: clean(b.lastName),
-      birth_date: dateOrNull(b.birthDate), sex: ['F', 'M', 'I'].includes(b.sex) ? b.sex : null, blood_type: clean(b.bloodType), phone: clean(b.phone), email: clean(b.email)?.toLowerCase() ?? null,
+      birth_date: dateOrNull(b.birthDate), sex: ['F', 'M', 'I'].includes(b.sex) ? b.sex : null, blood_type: clean(b.bloodType), phone: V.phone(b.phone), email: clean(b.email)?.toLowerCase() ?? null,
       address: clean(b.address), city: clean(b.city), profession: clean(b.profession), professional_card: clean(b.professionalCard), rethus: clean(b.rethus),
       eps: clean(b.eps), arl: clean(b.arl), pension_fund: clean(b.pensionFund), severance_fund: clean(b.severanceFund),
-      emergency_contact: clean(b.emergencyContact), emergency_phone: clean(b.emergencyPhone), position_id: Number(b.positionId) || null,
+      emergency_contact: clean(b.emergencyContact), emergency_phone: V.phone(b.emergencyPhone), position_id: Number(b.positionId) || null,
       ips_service_id: Number(b.ipsServiceId) || null, user_id: Number(b.userId) || null, notes: clean(b.notes),
       specialty: clean(b.specialty), assigned_service: clean(b.assignedService)?.toUpperCase() ?? null, hire_date: dateOrNull(b.hireDate), status,
       education_level: EDUCATION_LEVELS.includes(b.educationLevel) ? b.educationLevel : null, degree_title: clean(b.degreeTitle), institution: clean(b.institution),

@@ -1,4 +1,5 @@
 require('dotenv').config()
+const V = require('./validate')
 const express = require('express')
 const cors = require('cors')
 const bcrypt = require('bcryptjs')
@@ -267,6 +268,7 @@ const validateUserInput = (b, { requirePassword }) => {
   if (b.role && !ROLES.includes(b.role)) errors.push('Rol inválido')
   if (b.role && b.role !== 'administrador' && !Number(b.siteId)) errors.push('Selecciona la sede (seccional, unidad municipal o grupo de apoyo)')
   if (clean(b.email) && !EMAIL_RE.test(clean(b.email))) errors.push('Correo no válido')
+  const idErr = V.docError(b.identification, null, 'La identificación'); if (idErr) errors.push(idErr)
   if (requirePassword && (!b.password || b.password.length < 6)) errors.push('La contraseña debe tener al menos 6 caracteres')
   if (!requirePassword && b.password && b.password.length < 6) errors.push('La contraseña debe tener al menos 6 caracteres')
   return errors
@@ -385,7 +387,7 @@ const validateSite = async (b, id) => {
   if (!clean(b.municipality)) e.push('El municipio es requerido')
   if (b.type !== 'seccional' && !Number(b.parentId)) e.push('Selecciona la seccional a la que pertenece')
   if (clean(b.email) && !EMAIL_RE.test(clean(b.email))) e.push('Correo no válido')
-  if (clean(b.phone) && !/^[0-9]{7,10}$/.test(clean(b.phone))) e.push('Teléfono inválido')
+  const phErr = V.phoneError(b.phone); if (phErr) e.push(phErr)
   const services = [...new Set((b.serviceIds || []).map(Number).filter(Boolean))]
   if (services.length) {
     const { data: ok } = await supabase.from('ips_services').select('id').in('id', services)
@@ -398,7 +400,7 @@ const validateSite = async (b, id) => {
   }
   return { errors: e, row: {
     type: b.type, name: clean(b.name), municipality: clean(b.municipality), parent_id: b.type === 'seccional' ? null : Number(b.parentId),
-    address: clean(b.address), phone: clean(b.phone), email: clean(b.email)?.toLowerCase() ?? null,
+    address: clean(b.address), phone: V.phone(b.phone), email: clean(b.email)?.toLowerCase() ?? null,
     has_ips: services.length > 0, active: b.active !== false, updated_at: new Date().toISOString()
   }, services }
 }
@@ -1135,6 +1137,7 @@ app.post('/registrar-toma-de-muestras-citologicas', auth(STAFF), requireIps('cit
   if (row.celular_contacto && !PHONE_RE.test(row.celular_contacto)) errors.push('El celular del contacto debe tener 10 dígitos')
   if (row.email && !EMAIL_RE.test(row.email)) errors.push('El correo no es válido')
   if (row.email) row.email = row.email.toLowerCase()
+  const docErr = V.docError(row.num_documento, row.tipo_documento); if (docErr) errors.push(docErr)
 
   // Primero se factura (Facturación → Servicios facturables) y el formulario toma esa factura por el documento de la paciente.
   // Sin el módulo de facturación en el plan, la citología se registra sin factura y queda "por facturar".
