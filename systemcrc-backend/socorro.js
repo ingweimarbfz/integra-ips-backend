@@ -4,6 +4,7 @@
 // materiales (salen y regresan) e insumos (se consumen y descuentan stock).
 // =====================================================================
 const { pageQuery, setTotal } = require('./paging')
+const tenant = require('./tenant')
 module.exports = (app, deps) => {
   const { userModules } = deps
   const { supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, scopeSite, applyScope, canAccessSite, targetSite } = deps
@@ -161,8 +162,9 @@ module.exports = (app, deps) => {
     return toDeactivate.length
   }
   // Se revisa al iniciar el servidor y cada 6 horas.
-  setTimeout(() => evaluateVolunteers().catch((e) => console.error('evaluateVolunteers', e.message)), 3000)
-  setInterval(() => evaluateVolunteers().catch((e) => console.error('evaluateVolunteers', e.message)), 6 * 3600 * 1000)
+  const evaluateAll = () => tenant.forEachOrg(supabase, evaluateVolunteers)
+  setTimeout(evaluateAll, 3000)
+  setInterval(evaluateAll, 6 * 3600 * 1000)
 
   app.get('/socorro/personas', auth(STAFF), hx(async (req, res) => {
     const { data, error } = await applyScope(supabase.from('volunteers').select('*, site:sites(name)'), scopeSite(req)).order('first_name')
@@ -304,7 +306,7 @@ module.exports = (app, deps) => {
     if ((desde && !ISO_DATE.test(desde)) || (hasta && !ISO_DATE.test(hasta))) return fail(res, 'Fechas inválidas', 400)
     let query = applyScope(supabase.from('gso_events')
       .select('id, code, name, place, area, status, started_at, ended_at, site_id, site:sites(name), coordinator:volunteers!gso_events_coordinator_id_fkey(first_name, last_name, carnet), gso_event_personnel(count), gso_event_supplies(count), gso_event_materials(count)', { count: 'exact' }), scopeSite(req))
-      .order('started_at', { ascending: false })
+      .order('started_at', { ascending: false }).order('id', { ascending: false })
     if (estado) query = query.eq('status', estado)
     const allowed = areasOf(req.user)
     if (AREAS.includes(req.query.area)) {

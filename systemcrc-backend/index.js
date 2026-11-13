@@ -7,6 +7,7 @@ const crypto = require('crypto')
 const { createClient } = require('@supabase/supabase-js')
 const compression = require('compression')
 const { pageQuery, setTotal } = require('./paging')
+const tenant = require('./tenant')
 const platform = require('./platform')
 let legal = null // documentos legales: se registra más abajo
 // Rutas permitidas mientras el contrato y el acuerdo de datos no estén firmados.
@@ -33,7 +34,7 @@ const fetchWithTimeout = async (url, opts = {}) => {
     const timer = setTimeout(() => ctrl.abort(new Error('Tiempo de espera agotado con la base de datos')), read ? SB_TIMEOUT.read : SB_TIMEOUT.write)
     if (opts.signal) opts.signal.addEventListener('abort', () => ctrl.abort(opts.signal.reason), { once: true })
     try {
-      return await fetch(url, { ...opts, signal: ctrl.signal })
+      return await fetch(url, { ...opts, headers: tenant.orgHeaders(opts.headers), signal: ctrl.signal })
     } catch (e) {
       if (!read || attempt >= 1 || opts.signal?.aborted) throw e
       console.warn(`[supabase] reintentando ${method} tras: ${e.message}`)
@@ -44,6 +45,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
   global: { fetch: fetchWithTimeout }
 })
+tenant.scopeClient(supabase)
+tenant.setEnsure((id) => platform.ensure(id))
 
 const app = express()
 // CORS_ORIGIN admite varios orígenes separados por coma (p. ej. localhost y la URL pública del frontend).
@@ -118,7 +121,7 @@ const ageAt = (birth, ref) => {
 // Usuarios y sesión
 // ======================================================================
 const SITE_SELECT = '*, site_services(service:ips_services(id, code, name, module, active)), warehouses(id, code, name, is_general, active)'
-const USER_COLUMNS = 'id, identification, name, last_name, username, role, email, avatar_url, signature_url, remunerado, active, created_at, site_id, modules, site:sites(' + SITE_SELECT + ')'
+const USER_COLUMNS = 'id, org_id, identification, name, last_name, username, role, email, avatar_url, signature_url, remunerado, active, created_at, site_id, modules, site:sites(' + SITE_SELECT + ')'
 
 const toUserDTO = (u) => ({
   id: u.id,
@@ -204,6 +207,15 @@ const auth = (roles = ALL) => async (req, res, next) => {
     if (error) throw error
     if (!user || !user.active) return fail(res, 'Usuario inactivo o inexistente', 401)
     if (user.role !== 'administrador' && user.site && !user.site.active) return fail(res, 'Tu sede está inactiva. Contacta al administrador.', 401)
+    // Multi-cliente: el resto de la petición corre en el contexto de la organización del usuario.
+    await platform.ensure(user.org_id)
+    return tenant.runAsOrg(user.org_id, () => authorize(req, res, next, roles, user))
+  } catch (e) {
+    fail(res, e)
+  }
+}
+const authorize = async (req, res, next, roles, user) => {
+  try {
     // Permisos: rol del endpoint + módulos del usuario.
     const mods = routeModules(req.path)
     if (mods && !mods.some(inPlan)) return fail(res, 'Tu plan no incluye este módulo. Consulta las opciones de plan con el proveedor.', 403)
@@ -240,7 +252,8 @@ app.post('/login', h(async (req, res) => {
   if (!ok) return fail(res, 'Nombre de usuario o contraseña incorrectos.', 401)
   if (!user.active) return fail(res, 'Tu usuario está inactivo. Contacta al administrador.', 403)
   if (user.role !== 'administrador' && user.site && !user.site.active) return fail(res, 'Tu sede está inactiva. Contacta al administrador.', 403)
-  res.send({ token: signToken(user), user: toUserDTO(user) })
+  await platform.ensure(user.org_id)
+  tenant.runAsOrg(user.org_id, () => res.send({ token: signToken(user), user: toUserDTO(user) }))
 }))
 
 app.get('/auth/me', auth(), (req, res) => res.send(toUserDTO(req.user)))
@@ -719,7 +732,7 @@ const serviceSettings = async (module) => {
 }
 const getSettings = async () => {
   const [{ data: s, error }, cold, cyto] = await Promise.all([
-    supabase.from('app_settings').select('*').eq('id', 1).single(),
+    supabase.from('app_settings').select('*').maybeSingle(),
     serviceSettings('cadena_frio'),
     getCytologyPrice()
   ])
@@ -742,8 +755,16 @@ const getSettings = async () => {
 }
 
 // Público: el login necesita el nombre, los colores y el logo antes de iniciar sesión.
+// Organización por defecto de la instalación (la que se muestra en el login antes de iniciar sesión).
+let defaultOrg = { id: null, at: 0 }
+const defaultOrgId = async () => {
+  if (defaultOrg.id && Date.now() - defaultOrg.at < 300000) return defaultOrg.id
+  const { data } = await supabase.from('plt_organizations').select('id').eq('is_current', true).maybeSingle()
+  defaultOrg = { id: data?.id || 1, at: Date.now() }
+  return defaultOrg.id
+}
 app.get('/configuracion/publica', h(async (req, res) => {
-  const s = await getSettings()
+  const s = await tenant.runAsOrg(Number(req.query.org) || await defaultOrgId(), () => getSettings())
   res.send({ ipsName: s.ipsName, shortName: s.shortName, primaryColor: s.primaryColor, secondaryColor: s.secondaryColor, logoUrl: s.logoUrl, loginImageUrl: s.loginImageUrl, loginDescription: s.loginDescription, loginFooter: s.loginFooter })
 }))
 
@@ -764,7 +785,7 @@ app.put('/configuracion', auth(ADMIN), h(async (req, res) => {
     ...('loginDescription' in b ? { login_description: clean(b.loginDescription)?.slice(0, 600) ?? null } : {}),
     ...('loginFooter' in b ? { login_footer: clean(b.loginFooter)?.slice(0, 200) ?? null } : {}),
     updated_at: new Date().toISOString()
-  }).eq('id', 1)
+  })
   if (error) throw error
   res.send(await getSettings())
 }))
@@ -773,7 +794,7 @@ app.post('/configuracion/logo', auth(ADMIN), h(async (req, res) => {
   const before = await getSettings()
   const url = await uploadImage('branding', 'logo', req.body?.image, ['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml'])
   if (!url) return fail(res, 'Imagen inválida (PNG, JPG, WEBP o SVG de máximo 2 MB)', 400)
-  const { error } = await supabase.from('app_settings').update({ logo_url: url, updated_at: new Date().toISOString() }).eq('id', 1)
+  const { error } = await supabase.from('app_settings').update({ logo_url: url, updated_at: new Date().toISOString() })
   if (error) throw error
   await removeStoredFile('branding', before.logoUrl)
   res.send(await getSettings())
@@ -784,14 +805,14 @@ app.post('/configuracion/login-imagen', auth(ADMIN), h(async (req, res) => {
   const before = await getSettings()
   const url = await uploadImage('branding', 'login', req.body?.image, ['image/png', 'image/jpeg', 'image/webp'])
   if (!url) return fail(res, 'Imagen inválida (PNG, JPG o WEBP de máximo 2 MB)', 400)
-  const { error } = await supabase.from('app_settings').update({ login_image_url: url, updated_at: new Date().toISOString() }).eq('id', 1)
+  const { error } = await supabase.from('app_settings').update({ login_image_url: url, updated_at: new Date().toISOString() })
   if (error) throw error
   await removeStoredFile('branding', before.loginImageUrl)
   res.send(await getSettings())
 }))
 app.delete('/configuracion/login-imagen', auth(ADMIN), h(async (req, res) => {
   const before = await getSettings()
-  const { error } = await supabase.from('app_settings').update({ login_image_url: null, updated_at: new Date().toISOString() }).eq('id', 1)
+  const { error } = await supabase.from('app_settings').update({ login_image_url: null, updated_at: new Date().toISOString() })
   if (error) throw error
   await removeStoredFile('branding', before.loginImageUrl)
   res.send(await getSettings())
@@ -799,7 +820,7 @@ app.delete('/configuracion/login-imagen', auth(ADMIN), h(async (req, res) => {
 
 app.delete('/configuracion/logo', auth(ADMIN), h(async (req, res) => {
   const before = await getSettings()
-  const { error } = await supabase.from('app_settings').update({ logo_url: null, updated_at: new Date().toISOString() }).eq('id', 1)
+  const { error } = await supabase.from('app_settings').update({ logo_url: null, updated_at: new Date().toISOString() })
   if (error) throw error
   await removeStoredFile('branding', before.logoUrl)
   res.send(await getSettings())

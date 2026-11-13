@@ -125,6 +125,7 @@ const terminos = ({ org, provider }) => ({
 })
 const RENDER = { contrato, datos, terminos }
 
+const tenant = require('./tenant')
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, platform } = deps
   const httpError = (status, message) => Object.assign(new Error(message), { status })
@@ -134,7 +135,8 @@ module.exports = (app, deps) => {
   const loadProvider = async () => (await supabase.from('plt_provider').select('*').eq('id', 1).single()).data || {}
   const loadOrg = async (id) => {
     const q = supabase.from('plt_organizations').select('*, plan:plt_plans(*)')
-    const { data } = id ? await q.eq('id', id).maybeSingle() : await q.eq('is_current', true).maybeSingle()
+    const org = id || tenant.currentOrg()
+    const { data } = org ? await q.eq('id', org).maybeSingle() : await q.eq('is_current', true).maybeSingle()
     return data
   }
   const loadFeatures = async () => (await supabase.from('plt_features').select('*').order('sort_order')).data || []
@@ -156,16 +158,19 @@ module.exports = (app, deps) => {
   }
 
   // Estado legal de la instalación (en caché): el cliente debe firmar contrato y acuerdo de datos vigentes.
-  const state = { pending: false, loadedAt: 0 }
+  // Estado por organización (en caché 30 s).
+  const states = new Map()
   const refresh = async () => {
     const org = await loadOrg()
-    if (!org) { Object.assign(state, { pending: false, loadedAt: Date.now() }); return state }
+    const key = org?.id || 0
+    if (!org) { const st = { pending: false, loadedAt: Date.now() }; states.set(key, st); return st }
     const { data } = await supabase.from('plt_legal_signatures').select('kind, version').eq('organization_id', org.id).eq('party', 'cliente')
     const ok = (k) => (data || []).some((s) => s.kind === k && s.version === VERSIONS[k])
-    Object.assign(state, { pending: !(ok('contrato') && ok('datos')), loadedAt: Date.now() })
-    return state
+    const st = { pending: !(ok('contrato') && ok('datos')), loadedAt: Date.now() }
+    states.set(key, st)
+    return st
   }
-  const current = async () => (Date.now() - state.loadedAt > 30000 ? refresh() : state)
+  const current = async () => { const st = states.get(tenant.currentOrg() || 0); return !st || Date.now() - st.loadedAt > 30000 ? refresh() : st }
 
   // ---------------------------------------------------------------- Sistema (usuarios de la instalación)
   app.get('/legal/estado', auth(), hx(async (req, res) => {
@@ -197,8 +202,8 @@ module.exports = (app, deps) => {
       signer_role: clean(b.signerRole), signature_url: req.user.signature_url, snapshot, ip: ipOf(req), user_agent: String(req.headers['user-agent'] || '').slice(0, 300)
     })
     if (error) { if (error.code === '23505') return fail(res, 'Este documento ya está firmado', 409); throw error }
-    await refresh(); platform?.refresh?.()
-    res.status(201).send({ ok: true, activationPending: state.pending })
+    const st = await refresh(); platform?.refresh?.()
+    res.status(201).send({ ok: true, activationPending: st.pending })
   }))
   app.post('/legal/terminos/aceptar', auth(), hx(async (req, res) => {
     if (req.body?.accept !== true) return fail(res, 'Debes aceptar los términos y condiciones', 400)
@@ -250,6 +255,6 @@ module.exports = (app, deps) => {
   // Público: términos y condiciones (para mostrarlos en la página de precios).
   app.get('/legal/publico/terminos', hx(async (req, res) => res.send(await render('terminos', null))))
 
-  return { state, current, refresh }
+  return { current, refresh }
 }
 module.exports.VERSIONS = VERSIONS

@@ -5,6 +5,7 @@
 // · Correo: SMTP del servidor. WhatsApp: API oficial de WhatsApp Business (WHATSAPP_TOKEN, WHATSAPP_PHONE_ID
 //   y opcionalmente WHATSAPP_TEMPLATE); sin API queda "manual" con el enlace wa.me listo para enviar.
 // =====================================================================
+const tenant = require('./tenant')
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, todayBogota, getSettings, share, TZ } = deps
   const STAFF = ['administrador', 'empleado']
@@ -19,7 +20,7 @@ module.exports = (app, deps) => {
   const waReady = () => Boolean(process.env.WHATSAPP_TOKEN && process.env.WHATSAPP_PHONE_ID)
   const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
 
-  const loadConfig = async () => (await supabase.from('vaccination_reminder_settings').select('*').eq('id', 1).single()).data
+  const loadConfig = async () => (await supabase.from('vaccination_reminder_settings').select('*').maybeSingle()).data
   const cfgDTO = (c) => ({ enabled: c.enabled, daysBefore: c.days_before, sendEmail: c.send_email, sendWhatsapp: c.send_whatsapp, runHour: c.run_hour, testMode: c.test_mode, testPhones: c.test_phones || [], testEmails: c.test_emails || [], officeHours: c.office_hours, lastRunOn: c.last_run_on })
 
   // Recordatorio por enviar: la última dosis de cada paciente y biológico con la siguiente dosis en los próximos N días.
@@ -128,7 +129,7 @@ module.exports = (app, deps) => {
         out.push({ recordId: r.id, patient: `${r.names} ${r.surnames || ''}`.trim(), channel: ch, status })
       }
     }
-    if (!opts.recordId) await supabase.from('vaccination_reminder_settings').update({ last_run_on: todayBogota() }).eq('id', 1)
+    if (!opts.recordId) await supabase.from('vaccination_reminder_settings').update({ last_run_on: todayBogota() })
     return out
   }
 
@@ -143,8 +144,9 @@ module.exports = (app, deps) => {
       if (hour >= cfg.run_hour && cfg.last_run_on !== todayBogota()) await run()
     } catch (e) { console.error('Recordatorios de vacunación:', e.message) }
   }
-  setTimeout(tick, 20000)
-  setInterval(tick, 15 * 60000).unref()
+  const tickAll = () => tenant.forEachOrg(supabase, tick)
+  setTimeout(tickAll, 20000)
+  setInterval(tickAll, 15 * 60000).unref()
 
   // ---------------------------------------------------------------- API
   app.get('/vacunacion/recordatorios', auth(STAFF), hx(async (req, res) => {
@@ -164,13 +166,13 @@ module.exports = (app, deps) => {
     if (!(hour >= 0 && hour <= 23)) return fail(res, 'Hora inválida', 400)
     const phones = (Array.isArray(b.testPhones) ? b.testPhones : []).map(digits).filter((x) => x.length >= 10)
     const emails = (Array.isArray(b.testEmails) ? b.testEmails : []).map((x) => clean(x)?.toLowerCase()).filter((x) => x && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x))
-    const { data, error } = await supabase.from('vaccination_reminder_settings').update({ enabled: Boolean(b.enabled), days_before: days, send_email: Boolean(b.sendEmail), send_whatsapp: Boolean(b.sendWhatsapp), run_hour: hour, test_mode: b.testMode !== false, test_phones: phones, test_emails: emails, office_hours: clean(b.officeHours), updated_at: new Date().toISOString() }).eq('id', 1).select('*').single()
+    const { data, error } = await supabase.from('vaccination_reminder_settings').update({ enabled: Boolean(b.enabled), days_before: days, send_email: Boolean(b.sendEmail), send_whatsapp: Boolean(b.sendWhatsapp), run_hour: hour, test_mode: b.testMode !== false, test_phones: phones, test_emails: emails, office_hours: clean(b.officeHours), updated_at: new Date().toISOString() }).select('*').single()
     if (error) throw error
     res.send(cfgDTO(data))
   }))
   app.put('/vacunacion/recordatorios/envio-general', auth(ADMIN), hx(async (req, res) => {
     if (!planOn()) return fail(res, 'Tu plan no incluye los recordatorios automáticos de próxima dosis. Consulta las opciones de plan.', 403)
-    const { data, error } = await supabase.from('vaccination_reminder_settings').update({ enabled: Boolean(req.body?.enabled), updated_at: new Date().toISOString() }).eq('id', 1).select('*').single()
+    const { data, error } = await supabase.from('vaccination_reminder_settings').update({ enabled: Boolean(req.body?.enabled), updated_at: new Date().toISOString() }).select('*').single()
     if (error) throw error
     res.send(cfgDTO(data))
   }))

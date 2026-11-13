@@ -452,7 +452,7 @@ module.exports = (app, deps) => {
     if ((desde && !ISO_DATE.test(desde)) || (hasta && !ISO_DATE.test(hasta))) return fail(res, 'Fechas inválidas', 400)
     let q = supabase.from('inventory_movements')
       .select('id, type, quantity, stock_after, note, created_at, transfer_ref, destination, users(name, last_name), counterpart:warehouses!inventory_movements_counterpart_warehouse_id_fkey(name), gso_events(id, code, name), item:inventory_items!inner(id, name, code, category, unit, lot, site_id, warehouse_id, product_id, site:sites(name), warehouse:warehouses(name))', { count: 'exact' })
-      .order('created_at', { ascending: false })
+      .order('created_at', { ascending: false }).order('id', { ascending: false })
     if (v.warehouse) q = q.eq('item.warehouse_id', v.warehouse)
     else if (v.site) q = q.eq('item.site_id', v.site)
     if (Number(req.query.item)) q = q.eq('item_id', Number(req.query.item))
