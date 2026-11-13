@@ -966,10 +966,14 @@ app.post('/registrar-temperatura', auth(STAFF), requireIps('cadena_frio'), h(asy
   if (error) { if (error.code === '23505') return fail(res, dupShiftMsg(shift), 409); throw error }
   const dto = toTempDTO(data)
   res.status(201).send(dto)
-  // Aviso por Telegram (en segundo plano): sede, lectura y si quedó fuera de rango.
+  // Aviso por Telegram (en segundo plano): sede, lectura, rango y estado de las lecturas del día.
   ;(async () => {
-    const [{ data: site }, cold] = await Promise.all([supabase.from('sites').select('name').eq('id', siteId).maybeSingle(), serviceSettings('cadena_frio')])
-    notifier.notify('temperatura', notifier.messages.temperatura({ ...dto, siteName: site?.name }, { min: Number(cold.temp_min), max: Number(cold.temp_max) }), siteId)
+    const [{ data: site }, cold, { data: rows }] = await Promise.all([
+      supabase.from('sites').select('name').eq('id', siteId).maybeSingle(), serviceSettings('cadena_frio'),
+      supabase.from('temperature').select('shift, slot').eq('site_id', siteId).eq('record_date', today)
+    ])
+    const day = plan.map((p) => ({ short: `${p.shift === 'manana' ? 'M' : 'T'}${p.slot}`, done: (rows || []).some((r) => r.shift === p.shift && (r.slot || 1) === p.slot) }))
+    notifier.notify('temperatura', notifier.messages.temperatura({ ...dto, siteName: site?.name }, { min: Number(cold.temp_min), max: Number(cold.temp_max) }, day), siteId)
   })().catch((e) => console.error('Aviso de temperatura:', e.message))
 }))
 
@@ -1355,12 +1359,12 @@ app.get('/dashboard', auth(NO_DRIVER), h(async (req, res) => {
 
 // Módulo Gestión de Socorro y Operaciones
 const SCOPE = { scopeSite, applyScope, canAccessSite, targetSite }
-require('./socorro')(app, { userModules, notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, ...SCOPE })
+require('./socorro')(app, { userModules, notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, ...SCOPE })
 // Preoperacional diario de vehículos
-require('./inspections')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, supabase, auth, h, fail, clean, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
+require('./inspections')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 // Módulo de vehículos (flota)
 // Módulo IPS: hoja de vida de equipos
-require('./inventory')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ_OFFSET, todayBogota, ...SCOPE })
+require('./inventory')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ_OFFSET, todayBogota, ...SCOPE })
 require('./equipment')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 require('./talento')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
 require('./estandares')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
@@ -1370,6 +1374,6 @@ const plt = platform.register(app, { supabase, auth, h, fail, clean, JWT_SECRET,
 legal = require('./legal')(app, { supabase, auth, h, fail, clean, ADMIN, platform: plt, pauth: plt.pauth })
 require('./search')(app, { supabase, auth, h, fail, clean, userModules, ...SCOPE })
 require('./signatures')(app, { supabase, auth, h, fail, clean, ADMIN, uploadImage, removeStoredFile, canAccessSite })
-require('./vehicles')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
+require('./vehicles')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 
 app.listen(PORT, () => console.log(`API escuchando en http://localhost:${PORT}`))

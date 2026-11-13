@@ -505,7 +505,7 @@ module.exports = (app, deps) => {
     const trip = tripDTO(await loadTrip(data.id))
     res.status(201).send(trip)
     if (trip.transfer) deps.notify?.('ambulancias', deps.notifyMsg().traslado(trip, 'iniciado'), v.site_id)
-    else deps.notify?.('vehicular', deps.notifyMsg().viaje(trip, 'iniciada'), v.site_id)
+    else deps.notify?.('vehicular', async () => deps.notifyMsg().viaje(trip, 'iniciada', await deps.notifier().eventPeople(trip.event?.id)), v.site_id)
   }))
 
   // Cerrar: km de llegada (tacómetro), foto del tacómetro, combustible y foto del ticket.
