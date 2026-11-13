@@ -139,7 +139,9 @@ module.exports = (app, deps) => {
         if (!open?.length) await supabase.from('vehicles').update({ current_km: km, updated_at: new Date().toISOString() }).eq('id', v.id)
       }
       const { data } = await supabase.from('vehicle_inspections').select(SELECT).eq('id', ins.id).single()
-      res.status(201).send(dto(data))
+      const created = dto(data)
+      res.status(201).send(created)
+      deps.notify?.('vehicular', deps.notifyMsg().preoperacional(created))
     } catch (e) {
       for (const u of uploaded) await removeStoredFile('vehicles', u)
       if (e.status) return fail(res, e.message, e.status)

@@ -964,7 +964,13 @@ app.post('/registrar-temperatura', auth(STAFF), requireIps('cadena_frio'), h(asy
     .insert({ temp_min: v.tempMin, temp_max: v.tempMax, created_by: req.user.id, site_id: siteId, record_date: today, shift: want.shift, slot: want.slot })
     .select(TEMP_SELECT).single()
   if (error) { if (error.code === '23505') return fail(res, dupShiftMsg(shift), 409); throw error }
-  res.status(201).send(toTempDTO(data))
+  const dto = toTempDTO(data)
+  res.status(201).send(dto)
+  // Aviso por Telegram (en segundo plano): sede, lectura y si quedó fuera de rango.
+  ;(async () => {
+    const [{ data: site }, cold] = await Promise.all([supabase.from('sites').select('name').eq('id', siteId).maybeSingle(), serviceSettings('cadena_frio')])
+    notifier.notify('temperatura', notifier.messages.temperatura({ ...dto, siteName: site?.name }, { min: Number(cold.temp_min), max: Number(cold.temp_max) }))
+  })().catch((e) => console.error('Aviso de temperatura:', e.message))
 }))
 
 const loadTemp = async (req) => {
@@ -1068,6 +1074,8 @@ const vaccination = require('./vaccination')(app, { supabase, auth, h, fail, cle
 const share = require('./share')(app, { supabase, auth, h, fail, clean, canAccessSite, getSettings: () => getSettings(), billing, vaccination, hasFeature: (k) => hasFeature(k) })
 // Recordatorios de la siguiente dosis por correo y WhatsApp (tarea diaria, modo prueba).
 require('./reminders')(app, { supabase, auth, h, fail, clean, ADMIN, todayBogota, getSettings: () => getSettings(), share, TZ, hasFeature: (k) => hasFeature(k) })
+// Notificaciones por Telegram (grupos por sección).
+const notifier = require('./notify')(app, { supabase, auth, h, fail, clean, ADMIN, TZ, inPlan: (m) => inPlan(m), hasFeature: (k) => hasFeature(k) })
 
 app.get('/citologias/datos-formulario', auth(STAFF), requireIps('citologia'), h(async (req, res) => {
   const [price, employees, last, lastSlide] = await Promise.all([
@@ -1347,9 +1355,9 @@ app.get('/dashboard', auth(NO_DRIVER), h(async (req, res) => {
 
 // Módulo Gestión de Socorro y Operaciones
 const SCOPE = { scopeSite, applyScope, canAccessSite, targetSite }
-require('./socorro')(app, { userModules, supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, ...SCOPE })
+require('./socorro')(app, { userModules, notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, ...SCOPE })
 // Preoperacional diario de vehículos
-require('./inspections')(app, { supabase, auth, h, fail, clean, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
+require('./inspections')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, supabase, auth, h, fail, clean, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 // Módulo de vehículos (flota)
 // Módulo IPS: hoja de vida de equipos
 require('./inventory')(app, { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ_OFFSET, todayBogota, ...SCOPE })
@@ -1362,6 +1370,6 @@ const plt = platform.register(app, { supabase, auth, h, fail, clean, JWT_SECRET,
 legal = require('./legal')(app, { supabase, auth, h, fail, clean, ADMIN, platform: plt, pauth: plt.pauth })
 require('./search')(app, { supabase, auth, h, fail, clean, userModules, ...SCOPE })
 require('./signatures')(app, { supabase, auth, h, fail, clean, ADMIN, uploadImage, removeStoredFile, canAccessSite })
-require('./vehicles')(app, { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
+require('./vehicles')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 
 app.listen(PORT, () => console.log(`API escuchando en http://localhost:${PORT}`))

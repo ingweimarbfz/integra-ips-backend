@@ -353,7 +353,9 @@ module.exports = (app, deps) => {
       if (isBusyError(pErr)) return fail(res, `${coord.first_name} ${coord.last_name} ya está en otro evento en curso.`, 409)
       throw pErr
     }
-    res.status(201).send(eventDTO(await loadEvent(data.id), req.user))
+    const created = eventDTO(await loadEvent(data.id), req.user)
+    res.status(201).send(created)
+    deps.notify?.(created.area === 'educacion' ? 'educacion' : 'socorro', deps.notifyMsg().evento(created, 'abierto'))
   }))
 
   app.get('/socorro/eventos/:id', auth(EVENTS), hx(async (req, res) => {
@@ -593,7 +595,9 @@ module.exports = (app, deps) => {
       updated_at: new Date().toISOString()
     }).eq('id', event.id)
     if (error) throw error
-    res.send(eventDTO(await loadEvent(event.id), req.user))
+    const closed = eventDTO(await loadEvent(event.id), req.user)
+    res.send(closed)
+    deps.notify?.(closed.area === 'educacion' ? 'educacion' : 'socorro', deps.notifyMsg().evento(closed, 'finalizado'))
   }))
 
   // ================================================================ Panel del voluntario
