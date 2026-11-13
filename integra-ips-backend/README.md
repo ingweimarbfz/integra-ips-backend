@@ -1,4 +1,4 @@
-# API SystemCRC (Express + Supabase)
+# API Integra IPS (Express + Supabase)
 
 Base de datos: proyecto Supabase `centro-vacunacion` (ref `jyiblnjcnnhxjavrhtas`; el nombre del proyecto en Supabase se cambia desde su panel).
 Tablas: `users`, `temperature`, `cytology_samples`, con RLS activo y sin acceso público. Solo este backend accede, usando la clave secreta.
@@ -9,7 +9,7 @@ Tablas: `users`, `temperature`, `cytology_samples`, con RLS activo y sin acceso 
 2. Ejecuta `npm install`.
 3. Ejecuta `npm start`. La API queda en http://localhost:4000.
 
-Frontend (`systemcrc/systemcrc`): `npm install && npm start`, en http://localhost:3000.
+Frontend (repositorio `integra-ips`, carpeta `integra-ips/`): `npm install && npm start`, en http://localhost:3000.
 
 ## Rutas
 - `POST /login` `{ userName, password }`: valida la contraseña con bcrypt en el servidor.

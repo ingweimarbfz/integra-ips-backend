@@ -1,5 +1,5 @@
 {
-  "name": "systemcrc-backend",
+  "name": "integra-ips-backend",
   "version": "0.1.0",
   "private": true,
   "dependencies": {
