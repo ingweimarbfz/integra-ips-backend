@@ -7,6 +7,7 @@
 // =====================================================================
 const crypto = require('crypto')
 
+const tenant = require('./tenant')
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, canAccessSite, getSettings, billing, vaccination } = deps
   const STAFF = ['administrador', 'empleado']
@@ -112,6 +113,10 @@ module.exports = (app, deps) => {
     const { data: share } = await supabase.from('document_shares').select('*').eq('token', String(req.params.token || '')).maybeSingle()
     if (!share) throw httpError(404, 'El enlace no existe')
     if (share.expires_at < new Date().toISOString()) throw httpError(410, 'El enlace venció: solicite uno nuevo a la IPS')
+    // El enlace es de un cliente: el documento se arma en el contexto de su organización.
+    return tenant.runAsOrg(share.org_id, () => publicView(req, res, share))
+  }))
+  const publicView = async (req, res, share) => {
     const doc = await resolveDoc(null, share.kind, share.ref)
     await supabase.from('document_shares').update({ views: (share.views || 0) + 1, last_viewed_at: new Date().toISOString() }).eq('token', share.token)
     const s = await getSettings()
@@ -126,6 +131,6 @@ module.exports = (app, deps) => {
       ? { ...pick(doc.data, ['numFactura', 'fecha', 'invoicedAt', 'serviceName', 'paciente', 'documento', 'payer', 'epsName', 'items', 'valorBase', 'descuento', 'descuentoNombre', 'iva', 'total', 'shared', 'valor', 'paymentMode', 'billingStatus', 'siteName']), dian }
       : { patient: pick(doc.data.patient, ['patient', 'docType', 'docNumber', 'birthDate', 'sex', 'epsName', 'populationGroup']), records: doc.data.records.map((r) => pick(r, ['id', 'appliedOn', 'vaccineId', 'vaccine', 'pai', 'dose', 'lot', 'vaccinator', 'vaccinatorSignature', 'siteName', 'nextDoseDate', 'nextDoseLabel'])) }
     res.send({ kind: share.kind, expiresAt: share.expires_at, institution: { name: s.ipsName, shortName: s.shortName, logoUrl: s.logoUrl, primaryColor: s.primaryColor }, data })
-  }))
+  }
   return { linkFor, smtpReady, mailer }
 }

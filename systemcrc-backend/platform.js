@@ -6,8 +6,20 @@
 const jwt = require('jsonwebtoken')
 const bcrypt = require('bcryptjs')
 
-// Estado del plan de esta instalación (se recarga cada minuto y cada vez que cambia algo en la plataforma).
-const state = { modules: null, features: null, plan: null, organization: null, loadedAt: 0 }
+const tenant = require('./tenant')
+
+// Estado del plan de cada organización (en caché un minuto; se recarga cuando cambia algo en la plataforma).
+const EMPTY = { modules: null, features: null, plan: null, organization: null, loadedAt: 0 }
+const states = new Map()
+const stateOf = (orgId) => (orgId && states.get(Number(orgId))) || EMPTY
+// Plan de la organización de la petición actual.
+const state = new Proxy({}, { get: (_, k) => stateOf(tenant.currentOrg())[k] })
+let loader = null
+const ensure = async (orgId) => {
+  const s = states.get(Number(orgId))
+  if (s && Date.now() - s.loadedAt < 60000) return s
+  return loader ? loader(Number(orgId)) : EMPTY
+}
 
 const register = (app, deps) => {
   const { supabase, h, fail, clean, JWT_SECRET, ISO_DATE, MODULE_KEYS } = deps
@@ -17,21 +29,26 @@ const register = (app, deps) => {
   const annual = (p) => Math.round((Number(p.price_month) * 12 * (1 - Number(p.annual_discount) / 100)) / 100) * 100
 
   // ---------------------------------------------------------------- Plan de esta instalación
-  const refresh = async () => {
-    const { data: org } = await supabase.from('plt_organizations').select('*, plan:plt_plans(*)').eq('is_current', true).maybeSingle()
+  const load = async (orgId) => {
+    const { data: org } = await supabase.from('plt_organizations').select('*, plan:plt_plans(*)').eq('id', orgId).maybeSingle()
     const { data: feats } = await supabase.from('plt_features').select('key, module_key')
-    if (!org || !org.plan) { Object.assign(state, { modules: null, features: null, plan: null, organization: null, loadedAt: Date.now() }); return }
+    // Organización inexistente: sin módulos. Sin plan asignado: sin restricción (como antes).
+    if (!org) { const st = { ...EMPTY, modules: [], features: [], loadedAt: Date.now() }; states.set(orgId, st); return st }
+    if (!org.plan) { const st = { ...EMPTY, organization: { id: org.id, name: org.name, status: org.status }, loadedAt: Date.now() }; states.set(orgId, st); return st }
     const keys = new Set([...(org.plan.features || []), ...(org.extra_features || [])])
     const suspended = ['suspendida', 'cancelada'].includes(org.status)
     const modules = suspended ? [] : (feats || []).filter((f) => f.module_key && keys.has(f.key)).map((f) => f.module_key)
-    Object.assign(state, {
-      modules: [...new Set(modules)], features: [...keys], loadedAt: Date.now(),
+    const st = {
+      modules: [...new Set(modules)], features: suspended ? [] : [...keys], loadedAt: Date.now(),
       plan: { id: org.plan.id, code: org.plan.code, name: org.plan.name, audience: org.plan.audience },
       organization: { id: org.id, name: org.name, status: org.status, billingCycle: org.billing_cycle, renewalDate: org.renewal_date }
-    })
+    }
+    states.set(orgId, st)
+    return st
   }
-  refresh().catch(() => {})
-  setInterval(() => refresh().catch(() => {}), 60000).unref()
+  loader = load
+  // Tras un cambio en la plataforma se recargan todas las organizaciones en caché.
+  const refresh = async () => { await Promise.all([...states.keys()].map((id) => load(id).catch(() => {}))) }
 
   // ---------------------------------------------------------------- Acceso a la plataforma (superadministrador)
   const signPlatform = (u) => jwt.sign({ sub: String(u.id), plt: true }, JWT_SECRET, { expiresIn: '8h' })
@@ -160,9 +177,14 @@ const register = (app, deps) => {
     mrr: o.plan && o.status === 'activa' ? (o.billing_cycle === 'anual' ? Math.round(annual(o.plan) / 12) : Number(o.plan.price_month)) : 0
   })
   const loadOrgs = async () => {
-    const { data, error } = await supabase.from('plt_organizations').select('*, plan:plt_plans(*)').order('is_current', { ascending: false }).order('name')
+    const [{ data, error }, { data: ready }, { data: people }] = await Promise.all([
+      supabase.from('plt_organizations').select('*, plan:plt_plans(*)').order('is_current', { ascending: false }).order('name'),
+      supabase.from('app_settings').select('org_id'),
+      supabase.from('users').select('org_id')
+    ])
     if (error) throw error
-    return data.map(orgDTO)
+    const users = (people || []).reduce((a, u) => { a[u.org_id] = (a[u.org_id] || 0) + 1; return a }, {})
+    return data.map((o) => ({ ...orgDTO(o), initialized: (ready || []).some((r) => r.org_id === o.id), users: users[o.id] || 0 }))
   }
   app.get('/plataforma/organizaciones', pauth, hx(async (req, res) => res.send(await loadOrgs())))
   const orgRow = async (b) => {
@@ -208,11 +230,42 @@ const register = (app, deps) => {
     await setCurrent(id, Boolean(req.body?.isCurrent)); await refresh()
     res.send({ ok: true })
   }))
+  // Alta de un cliente: configuración y catálogos iniciales, su primera sede (con bodega general) y su administrador.
+  app.post('/plataforma/organizaciones/:id/inicializar', pauth, hx(async (req, res) => {
+    const id = Number(req.params.id)
+    const { data: org } = await supabase.from('plt_organizations').select('id, name').eq('id', id).maybeSingle()
+    if (!org) return fail(res, 'Organización no encontrada', 404)
+    const { data: done } = await supabase.from('app_settings').select('org_id').eq('org_id', id).maybeSingle()
+    if (done) return fail(res, 'Esta organización ya fue inicializada', 409)
+    const b = req.body || {}
+    const e = []
+    for (const [k, l] of [['siteName', 'Nombre de la sede'], ['municipality', 'Municipio'], ['adminName', 'Nombre del administrador'], ['adminLastName', 'Apellidos'], ['adminIdentification', 'Identificación'], ['adminUsername', 'Usuario']]) if (!clean(b[k])) e.push(`${l} es requerido`)
+    if (!b.adminPassword || String(b.adminPassword).length < 8) e.push('La contraseña debe tener al menos 8 caracteres')
+    if (clean(b.adminEmail) && !/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(clean(b.adminEmail))) e.push('Correo inválido')
+    if (e.length) return fail(res, e.join('. '), 400)
+    const { data: taken } = await supabase.from('users').select('id').eq('username', clean(b.adminUsername)).maybeSingle()
+    if (taken) return fail(res, 'Ese nombre de usuario ya existe en la plataforma; elige otro', 409)
+    const { error: se } = await supabase.rpc('seed_org', { p_org: id, p_name: org.name })
+    if (se) throw se
+    await tenant.runAsOrg(id, async () => {
+      const { data: site, error: e1 } = await supabase.from('sites').insert({ type: 'seccional', name: clean(b.siteName), municipality: clean(b.municipality), has_ips: true }).select('id').single()
+      if (e1) throw e1
+      const { error: e2 } = await supabase.from('warehouses').insert({ site_id: site.id, name: `Bodega general ${clean(b.siteName)}`.slice(0, 120), code: 'BG-01', is_general: true })
+      if (e2) throw e2
+      const { error: e3 } = await supabase.from('users').insert({
+        identification: clean(b.adminIdentification), name: clean(b.adminName), last_name: clean(b.adminLastName), username: clean(b.adminUsername),
+        email: clean(b.adminEmail)?.toLowerCase() ?? null, password_hash: await bcrypt.hash(String(b.adminPassword), 10), role: 'administrador', site_id: site.id
+      })
+      if (e3) throw e3
+    })
+    await refresh()
+    res.status(201).send({ ok: true })
+  }))
   app.delete('/plataforma/organizaciones/:id', pauth, hx(async (req, res) => {
     const { data: cur } = await supabase.from('plt_organizations').select('is_current').eq('id', Number(req.params.id)).maybeSingle()
     if (cur?.is_current) return fail(res, 'Es la organización de esta instalación. Marca otra como actual antes de eliminarla.', 409)
     const { error } = await supabase.from('plt_organizations').delete().eq('id', Number(req.params.id))
-    if (error) throw error
+    if (error) { if (error.code === '23503') return fail(res, 'La organización ya tiene datos (usuarios, sedes o registros). Cámbiala a estado cancelada en lugar de eliminarla.', 409); throw error }
     res.send({ ok: true })
   }))
 
@@ -231,7 +284,7 @@ const register = (app, deps) => {
       byPlan: plans.map((p) => ({ id: p.id, name: p.name, audience: p.audience, organizations: orgs.filter((o) => o.planId === p.id).length, mrr: orgs.filter((o) => o.planId === p.id).reduce((a, o) => a + o.mrr, 0) })),
       byCycle: ['mensual', 'anual'].map((c) => ({ name: c === 'mensual' ? 'Mensual' : 'Anual', value: active.filter((o) => o.billingCycle === c).length })),
       renewals: orgs.filter((o) => o.renewalDate && o.renewalDate <= in30 && o.status !== 'cancelada').sort((a, b) => a.renewalDate.localeCompare(b.renewalDate)).slice(0, 10),
-      current: state.organization ? { ...state.organization, plan: state.plan, modules: state.modules } : null
+      current: null
     })
   }))
 
@@ -239,7 +292,7 @@ const register = (app, deps) => {
   app.get('/plataforma/precios', hx(async (req, res) => res.send({ groups: GROUPS, plans: await loadPlans(true) })))
 
   // Plan de esta instalación (para el sistema).
-  app.get('/plan/actual', hx(async (req, res) => res.send({ plan: state.plan, organization: state.organization, modules: state.modules, features: state.features })))
+  app.get('/plan/actual', deps.auth(), hx(async (req, res) => res.send({ plan: state.plan, organization: state.organization, modules: state.modules, features: state.features })))
 
 
   // ---------------------------------------------------------------- Solicitudes de mejora de plan
@@ -252,7 +305,7 @@ const register = (app, deps) => {
   const REQ_SELECT = '*, org:plt_organizations(name), from:plt_plans!plt_upgrade_requests_from_plan_id_fkey(name), to:plt_plans!plt_upgrade_requests_to_plan_id_fkey(name), user:users(name, last_name, email)'
   // Opciones para el usuario del sistema: plan actual, planes disponibles y su última solicitud.
   app.get('/plan/opciones', deps.auth(), hx(async (req, res) => {
-    const { data: org } = await supabase.from('plt_organizations').select('*, plan:plt_plans(*)').eq('is_current', true).maybeSingle()
+    const { data: org } = await supabase.from('plt_organizations').select('*, plan:plt_plans(*)').eq('id', tenant.currentOrg()).maybeSingle()
     const plans = (await loadPlans(true)).filter((p) => !org || org.org_type === 'esal' || p.audience === 'ips')
     const { data: last } = org ? await supabase.from('plt_upgrade_requests').select(REQ_SELECT).eq('organization_id', org.id).order('created_at', { ascending: false }).limit(1).maybeSingle() : { data: null }
     res.send({
@@ -261,7 +314,7 @@ const register = (app, deps) => {
     })
   }))
   app.post('/plan/solicitud', deps.auth(['administrador']), hx(async (req, res) => {
-    const { data: org } = await supabase.from('plt_organizations').select('id, plan_id, org_type').eq('is_current', true).maybeSingle()
+    const { data: org } = await supabase.from('plt_organizations').select('id, plan_id, org_type').eq('id', tenant.currentOrg()).maybeSingle()
     if (!org) return fail(res, 'Esta instalación no tiene una organización asociada', 400)
     const b = req.body || {}
     const { data: plan } = await supabase.from('plt_plans').select('id, audience, active').eq('id', Number(b.planId)).maybeSingle()
@@ -299,4 +352,4 @@ const register = (app, deps) => {
   return { refresh, pauth }
 }
 
-module.exports = { state, register }
+module.exports = { state, stateOf, ensure, register }

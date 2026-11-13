@@ -240,7 +240,7 @@ module.exports = (app, deps) => {
   // Copago y cuota moderadora (Acuerdo 260 de 2004): los paga el afiliado cuando la EPS asume el servicio; exentos P&P y poblaciones especiales.
   const TAX_FIELDS = { uvt: 'uvt', uvtYear: 'uvt_year', ivaRate: 'iva_rate', retefuenteRate: 'retefuente_rate', retefuenteMinUvt: 'retefuente_min_uvt', retefuenteEps: 'retefuente_eps', retefuenteGeneralRate: 'retefuente_general_rate', retefuenteEmpresa: 'retefuente_empresa', reteicaPerMil: 'reteica_per_mil', reteicaExcludeEps: 'reteica_exclude_eps', cuotaModeradora: 'cuota_moderadora', copagoPct: 'copago_pct', copagoTopeEvento: 'copago_tope_evento', copagoSubsidiadoPct: 'copago_subsidiado_pct', dianResolution: 'dian_resolution', dianPrefix: 'dian_prefix', dianFrom: 'dian_from', dianTo: 'dian_to', dianValidUntil: 'dian_valid_until' }
   const loadTax = async () => {
-    const { data, error } = await supabase.from('billing_tax_settings').select('*').eq('id', 1).single()
+    const { data, error } = await supabase.from('billing_tax_settings').select('*').maybeSingle()
     if (error) throw error
     return data
   }
@@ -267,7 +267,7 @@ module.exports = (app, deps) => {
     row.dian_from = b.dianFrom ? num(b.dianFrom, 0) : null; row.dian_to = b.dianTo ? num(b.dianTo, 0) : null
     row.dian_valid_until = ISO_DATE.test(b.dianValidUntil || '') ? b.dianValidUntil : null
     row.updated_at = new Date().toISOString()
-    const { data, error } = await supabase.from('billing_tax_settings').update(row).eq('id', 1).select('*').single()
+    const { data, error } = await supabase.from('billing_tax_settings').update(row).select('*').single()
     if (error) throw error
     res.send(taxDTO(data))
   }))
