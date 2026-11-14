@@ -7,14 +7,15 @@
 // · El envío nunca bloquea ni hace fallar el registro que lo origina (se ejecuta en segundo plano).
 // =====================================================================
 module.exports = (app, deps) => {
-  const { supabase, auth, h, fail, clean, ADMIN, inPlan, hasFeature, TZ } = deps
+  const { supabase, auth, h, fail, clean, ADMIN, inPlan, hasFeature, TZ, userModules } = deps
   const SECTIONS = {
     temperatura: { label: 'Registro de temperatura', module: 'temperatura', hint: 'Cada lectura registrada y las que quedan fuera de rango' },
     socorro: { label: 'Eventos y emergencias', module: 'socorro', hint: 'Apertura y cierre de eventos y emergencias' },
     vehicular: { label: 'Vehicular', module: 'flota', hint: 'Actividad vehicular (salida y cierre) y preoperacional' },
     educacion: { label: 'Actividades de educación', module: 'educacion', hint: 'Apertura y cierre de actividades de educación' },
     ambulancias: { label: 'Ambulancias (traslado asistencial)', module: 'traslado', hint: 'Salida y llegada de cada traslado asistencial TAB/TAM' },
-    inventario: { label: 'Inventario y bodegas', module: 'inventario', hint: 'Ingresos a la bodega general, traslados entre bodegas, entregas, bajas y ajustes' }
+    inventario: { label: 'Inventario y bodegas', module: 'inventario', hint: 'Ingresos a la bodega general, traslados entre bodegas, entregas, bajas y ajustes' },
+    academico: { label: 'Clases de educación (institución ETDH)', module: 'edu_programas', hint: 'Clases programadas, reprogramadas y canceladas (además, cada grupo académico avisa en su propio grupo de Telegram)' }
   }
   const API = 'https://api.telegram.org'
   const httpError = (status, message) => Object.assign(new Error(message), { status })
@@ -28,8 +29,19 @@ module.exports = (app, deps) => {
   const tg = async (token, method, body) => {
     const r = await fetch(`${API}/bot${token}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}), signal: AbortSignal.timeout(15000) })
     const j = await r.json().catch(() => ({}))
-    if (!j.ok) throw httpError(400, `Telegram: ${j.description || `error ${r.status}`}`)
+    if (!j.ok) throw Object.assign(httpError(400, `Telegram: ${j.description || `error ${r.status}`}`), { migrateTo: j.parameters?.migrate_to_chat_id ? String(j.parameters.migrate_to_chat_id) : null })
     return j.result
+  }
+  // Al hacer administrador al bot (o al crecer), Telegram convierte el grupo en supergrupo y le cambia el id:
+  // se actualiza el id guardado en las secciones y en los grupos académicos, y se reintenta el envío.
+  const sendTo = async (token, chatId, html) => {
+    try { await tg(token, 'sendMessage', { chat_id: chatId, text: html, parse_mode: 'HTML', disable_web_page_preview: true }); return String(chatId) } catch (e) {
+      if (!e.migrateTo) throw e
+      await supabase.from('notification_channels').update({ chat_id: e.migrateTo }).eq('chat_id', String(chatId))
+      await supabase.from('edu_groups').update({ telegram_chat_id: e.migrateTo }).eq('telegram_chat_id', String(chatId))
+      await tg(token, 'sendMessage', { chat_id: e.migrateTo, text: html, parse_mode: 'HTML', disable_web_page_preview: true })
+      return e.migrateTo
+    }
   }
   const loadSettings = async () => (await supabase.from('notification_settings').select('*').maybeSingle()).data
   const sectionsDTO = () => Object.entries(SECTIONS).map(([key, s]) => ({ key, label: s.label, hint: s.hint, module: s.module, available: inPlan(s.module) }))
@@ -47,11 +59,39 @@ module.exports = (app, deps) => {
     const { data: chans } = await q
     for (const c of chans || []) {
       let status = 'enviado'; let detail = null
-      try { await tg(st.bot_token, 'sendMessage', { chat_id: c.chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: true }) } catch (e) { status = 'error'; detail = e.message.slice(0, 300) }
-      await supabase.from('notification_log').insert({ section, chat_id: c.chat_id, status, detail, site_id: siteId || null })
+      let sentTo = c.chat_id
+      try { sentTo = await sendTo(st.bot_token, c.chat_id, html) } catch (e) { status = 'error'; detail = e.message.slice(0, 300) }
+      await supabase.from('notification_log').insert({ section, chat_id: sentTo, status, detail, site_id: siteId || null })
     }
   }
   const notify = (section, html, siteId) => { send(section, html, siteId).catch((e) => console.error('Telegram:', e.message)) }
+  // Envío directo a un grupo de Telegram (p. ej. el grupo de un grupo académico de Educación), con el bot de la organización.
+  const toChat = (chatId, html, section = 'academico') => {
+    const run = async () => {
+      if (!chatId || !featureOn() || (SECTIONS[section] && !inPlan(SECTIONS[section].module))) return
+      const st = await loadSettings()
+      if (!st?.enabled || !st.bot_token) return
+      let status = 'enviado'; let detail = null
+      let sentTo = String(chatId)
+      try { sentTo = await sendTo(st.bot_token, chatId, html) } catch (e) { status = 'error'; detail = e.message.slice(0, 300) }
+      await supabase.from('notification_log').insert({ section, chat_id: sentTo, status, detail, site_id: null })
+    }
+    run().catch((e) => console.error('Telegram:', e.message))
+  }
+  // Grupos donde está el bot (para elegir el grupo de Telegram de un grupo académico).
+  const findGroups = async () => {
+    const st = await loadSettings()
+    if (!st?.bot_token) throw httpError(400, 'Primero configura el bot de Telegram en Notificaciones')
+    const ups = await tg(st.bot_token, 'getUpdates', { limit: 100, allowed_updates: ['message', 'my_chat_member', 'channel_post'] })
+    const found = new Map()
+    for (const u of ups || []) {
+      const chat = u.message?.chat || u.my_chat_member?.chat || u.channel_post?.chat
+      if (!chat || !['group', 'supergroup', 'channel'].includes(chat.type)) continue
+      if (u.my_chat_member && ['left', 'kicked'].includes(u.my_chat_member.new_chat_member?.status)) { found.delete(String(chat.id)); continue }
+      found.set(String(chat.id), { chatId: String(chat.id), title: chat.title || 'Grupo sin nombre', type: chat.type })
+    }
+    return [...found.values()]
+  }
   const when = (iso) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'medium', timeStyle: 'short', timeZone: TZ }).format(iso ? new Date(iso) : new Date())
 
   // Mensajes de cada evento del sistema (diseño aprobado: título, separador, datos con emojis y listas con viñetas).
@@ -259,5 +299,64 @@ module.exports = (app, deps) => {
     res.send({ ok: true })
   }))
 
-  return { notify, messages, SECTIONS, byRef, lastOf, eventPeople, invLines, stockTag, signed }
+  // ---------------------------------------------------------------- Mis notificaciones (cualquier usuario)
+  // Cada usuario ve los grupos de Telegram que le corresponden (secciones de sus módulos y su sede; estudiantes y docentes,
+  // además, los grupos de sus grupos académicos) y pide un enlace personal para unirse (un uso, válido 24 horas).
+  // El bot debe ser administrador del grupo con permiso para invitar.
+  const myChats = async (u) => {
+    const out = []
+    const mods = userModules ? userModules(u) : []
+    if (!['estudiante', 'docente'].includes(u.role)) {
+      const { data: chans } = await supabase.from('notification_channels').select('*, site:sites(name)').eq('enabled', true).order('section')
+      for (const c of chans || []) {
+        const sec = SECTIONS[c.section]
+        if (!sec || !inPlan(sec.module) || !(u.role === 'administrador' || mods.includes(sec.module))) continue
+        if (u.role !== 'administrador' && c.site_id && u.site_id && Number(c.site_id) !== Number(u.site_id)) continue
+        if (out.some((x) => x.chatId === c.chat_id)) continue
+        out.push({ key: `c${c.id}`, chatId: c.chat_id, title: c.title || sec.label, kind: 'seccion', label: sec.label, hint: sec.hint, site: c.site?.name || 'Todas las sedes' })
+      }
+    }
+    let groupIds = []
+    if (u.role === 'estudiante') {
+      const { data: st } = await supabase.from('edu_students').select('id').eq('user_id', u.id).maybeSingle()
+      if (st) { const { data: enr } = await supabase.from('edu_enrollments').select('group_id').eq('student_id', st.id).in('status', ['matriculado', 'aplazado']); groupIds = (enr || []).map((e) => e.group_id).filter(Boolean) }
+    } else if (u.role === 'docente') {
+      const { data: ses } = await supabase.from('edu_sessions').select('group_id').eq('teacher_user_id', u.id)
+      groupIds = (ses || []).map((x) => x.group_id)
+    }
+    groupIds = [...new Set(groupIds)]
+    if (groupIds.length) {
+      const { data: gs } = await supabase.from('edu_groups').select('id, code, telegram_chat_id, telegram_title, program:edu_programs(name)').in('id', groupIds).not('telegram_chat_id', 'is', null)
+      for (const g of gs || []) out.push({ key: `g${g.id}`, chatId: g.telegram_chat_id, title: g.telegram_title || `Grupo ${g.code}`, kind: 'grupo', label: `${g.program?.name || 'Educación'} · grupo ${g.code}`, hint: 'Clases programadas, cambios, cancelaciones, recordatorios, talleres y material nuevo de tu grupo', site: null })
+    }
+    return out
+  }
+  app.get('/mis-notificaciones', auth(), gate, hx(async (req, res) => {
+    const st = await loadSettings()
+    if (!st?.bot_token || !st.enabled) return res.send({ enabled: false, items: [] })
+    const items = await myChats(req.user)
+    // ¿Ya está el usuario en el grupo? Solo si tiene vinculado su Telegram (no aplica); se indica si el bot puede invitar.
+    let botId = null
+    try { botId = (await tg(st.bot_token, 'getMe')).id } catch { /* sin conexión */ }
+    const withState = await Promise.all(items.map(async ({ chatId, ...x }) => {
+      let canInvite = null
+      if (botId) { try { const m = await tg(st.bot_token, 'getChatMember', { chat_id: chatId, user_id: botId }); canInvite = m.status === 'creator' || (m.status === 'administrator' && m.can_invite_users !== false) } catch { canInvite = false } }
+      return { ...x, canInvite }
+    }))
+    res.send({ enabled: true, bot: st.bot_username ? `@${st.bot_username}` : null, items: withState })
+  }))
+  app.post('/mis-notificaciones/:key/unirme', auth(), gate, hx(async (req, res) => {
+    const st = await loadSettings()
+    if (!st?.bot_token || !st.enabled) return fail(res, 'Las notificaciones de Telegram no están activas', 400)
+    const item = (await myChats(req.user)).find((x) => x.key === req.params.key)
+    if (!item) return fail(res, 'Ese grupo no está disponible para ti', 404)
+    try {
+      const link = await tg(st.bot_token, 'createChatInviteLink', { chat_id: item.chatId, name: `${req.user.name || ''} ${req.user.last_name || ''}`.trim().slice(0, 32) || 'Integra', member_limit: 1, expire_date: Math.floor(Date.now() / 1000) + 86400 })
+      res.send({ link: link.invite_link, expiresIn: '24 horas' })
+    } catch (e) {
+      fail(res, 'El bot no puede crear la invitación: pide al administrador que haga al bot administrador del grupo con permiso para invitar usuarios.', 409)
+    }
+  }))
+
+  return { notify, toChat, findGroups, esc, messages, SECTIONS, byRef, lastOf, eventPeople, invLines, stockTag, signed }
 }

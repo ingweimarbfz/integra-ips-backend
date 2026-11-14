@@ -24,7 +24,7 @@ const ensure = async (orgId) => {
 
 const register = (app, deps) => {
   const { supabase, h, fail, clean, JWT_SECRET, ISO_DATE, MODULE_KEYS } = deps
-  const GROUPS = { ips: 'Servicios de IPS', estandares: 'Estándares transversales', operaciones: 'Operaciones', voluntariado: 'Socorro y voluntariado', general: 'Generales' }
+  const GROUPS = { ips: 'Servicios de IPS', estandares: 'Estándares transversales', operaciones: 'Operaciones', voluntariado: 'Socorro y voluntariado', educacion: 'Educación (institución ETDH)', general: 'Generales' }
   const httpError = (status, message) => Object.assign(new Error(message), { status })
   const hx = (fn) => h(async (req, res) => { try { await fn(req, res) } catch (e) { if (e.status) return fail(res, e.message, e.status); throw e } })
   const annual = (p) => Math.round((Number(p.price_month) * 12 * (1 - Number(p.annual_discount) / 100)) / 100) * 100
@@ -134,7 +134,7 @@ const register = (app, deps) => {
     if (!(Number(b.priceMonth) >= 0)) e.push('Precio mensual inválido')
     const disc = Number(b.annualDiscount ?? 16.7)
     if (Number.isNaN(disc) || disc < 0 || disc > 90) e.push('Descuento anual inválido (0 a 90 %)')
-    if (!['ips', 'esal'].includes(b.audience)) e.push('Tipo de cliente inválido')
+    if (!['ips', 'esal', 'etdh'].includes(b.audience)) e.push('Tipo de cliente inválido')
     if (e.length) throw httpError(400, e.join('. '))
     const valid = new Set((await loadFeatures()).map((f) => f.key))
     const intOrNull = (v) => (v === '' || v == null ? null : Math.max(0, Math.round(Number(v))) || null)
@@ -191,7 +191,7 @@ const register = (app, deps) => {
   const orgRow = async (b) => {
     const e = []
     if (!clean(b.name)) e.push('El nombre es requerido')
-    if (!['ips', 'esal'].includes(b.orgType)) e.push('Tipo de organización inválido')
+    if (!['ips', 'esal', 'etdh'].includes(b.orgType)) e.push('Tipo de organización inválido')
     if (!['mensual', 'anual'].includes(b.billingCycle)) e.push('Ciclo de pago inválido')
     if (!['prueba', 'activa', 'suspendida', 'cancelada'].includes(b.status)) e.push('Estado inválido')
     for (const d of [b.startDate, b.renewalDate]) if (clean(d) && !ISO_DATE.test(d)) e.push('Fecha inválida')
@@ -309,7 +309,7 @@ const register = (app, deps) => {
   // Opciones para el usuario del sistema: plan actual, planes disponibles y su última solicitud.
   app.get('/plan/opciones', deps.auth(), hx(async (req, res) => {
     const { data: org } = await supabase.from('plt_organizations').select('*, plan:plt_plans(*)').eq('id', tenant.currentOrg()).maybeSingle()
-    const plans = (await loadPlans(true)).filter((p) => !org || org.org_type === 'esal' || p.audience === 'ips')
+    const plans = (await loadPlans(true)).filter((p) => !org || org.org_type === 'esal' || p.audience !== 'esal')
     const { data: last } = org ? await supabase.from('plt_upgrade_requests').select(REQ_SELECT).eq('organization_id', org.id).order('created_at', { ascending: false }).limit(1).maybeSingle() : { data: null }
     res.send({
       organization: org ? { name: org.name, orgType: org.org_type, billingCycle: org.billing_cycle, renewalDate: org.renewal_date, status: org.status } : null,

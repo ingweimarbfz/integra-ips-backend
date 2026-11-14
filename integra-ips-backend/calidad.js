@@ -1,4 +1,6 @@
 // =====================================================================
+// Área: ?area=educacion usa el mismo árbol para la acreditación de la institución ETDH (Académico):
+//   un árbol institucional (sin programa) y uno por programa (qdoc_folders.edu_program_id). Sin área = calidad de la IPS.
 // Calidad IPS · Documentos generales
 // · Ítems principales configurables (nivel 1, con su tipo) y carpetas internas hasta el 3.er nivel.
 // · En cualquier carpeta se cargan documentos y formatos (PDF, imágenes, Word, Excel) como en Procesos prioritarios.
@@ -10,7 +12,7 @@ const crypto = require('crypto')
 const { htmlFields } = require('./htmldoc')
 
 module.exports = (app, deps) => {
-  const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite } = deps
+  const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, userHas } = deps
   const STAFF = ['administrador', 'empleado']
   const BUCKET = 'estandares'
   const MAX = 15 * 1024 * 1024
@@ -47,7 +49,18 @@ module.exports = (app, deps) => {
   // ---------------------------------------------------------------- Servicios
   // Servicios de IPS activos que el usuario puede ver: el administrador, todos (o los de la sede elegida);
   // el empleado, los habilitados en su sede.
+  const AREA_MODULES = { calidad: ['doc_generales'], educacion: ['edu_programas', 'edu_dashboard', 'edu_estudiantes'] }
+  const areaOf = (req) => (req.query.area === 'educacion' || req.body?.area === 'educacion' ? 'educacion' : 'calidad')
+  // El usuario debe tener el módulo del área (Doc. Generales o Educación).
+  const checkArea = (req, area) => { if (userHas && !AREA_MODULES[area].some((m) => userHas(req.user, m))) throw httpError(403, 'No tienes habilitado este módulo') }
+  // Ámbito de una carpeta: el servicio de IPS (calidad) o el programa (educación).
+  const scopeId = (f) => (f.area === 'educacion' ? f.edu_program_id : f.service_id) ?? null
   const servicesFor = async (req) => {
+    if (areaOf(req) === 'educacion') {
+      const { data, error } = await supabase.from('edu_programs').select('id, code, name').eq('active', true).order('name')
+      if (error) throw error
+      return data.map((p) => ({ id: p.id, code: p.code, name: p.name, module: 'educacion' }))
+    }
     const { data, error } = await supabase.from('ips_services').select('id, code, name, module, site_services(site_id)').eq('active', true).order('name')
     if (error) throw error
     const site = scopeSite(req)
@@ -55,11 +68,11 @@ module.exports = (app, deps) => {
   }
   // ?servicio=general → null (generales); ?servicio=<id> → ese servicio; sin parámetro → undefined (todos).
   const serviceParam = (v) => (v === 'general' ? null : Number(v) || undefined)
-  const inService = (f, sid) => sid === undefined || (f.service_id ?? null) === sid
+  const inService = (f, sid) => sid === undefined || scopeId(f) === sid
 
   // ---------------------------------------------------------------- Carpetas
-  const loadFolders = async () => {
-    const { data, error } = await supabase.from('qdoc_folders').select('*').order('level').order('sort_order').order('name')
+  const loadFolders = async (area = 'calidad') => {
+    const { data, error } = await supabase.from('qdoc_folders').select('*').eq('area', area).order('level').order('sort_order').order('name')
     if (error) throw error
     return data
   }
@@ -69,7 +82,7 @@ module.exports = (app, deps) => {
   const folderDTO = (f, folders, counts) => {
     const path = pathOf(folders, f.id)
     return {
-      id: f.id, parentId: f.parent_id, level: f.level, serviceId: f.service_id ?? null, code: f.code, name: f.name, kind: path[0]?.kind ?? null, rootId: path[0]?.id ?? f.id, description: f.description, sortOrder: f.sort_order, active: f.active,
+      id: f.id, parentId: f.parent_id, level: f.level, serviceId: scopeId(f), code: f.code, name: f.name, kind: path[0]?.kind ?? null, rootId: path[0]?.id ?? f.id, description: f.description, sortOrder: f.sort_order, active: f.active,
       path: path.map((p) => ({ id: p.id, name: p.name, code: p.code })),
       docs: counts[f.id] || 0, totalDocs: descendants(folders, f.id).reduce((a, x) => a + (counts[x] || 0), 0)
     }
@@ -82,36 +95,44 @@ module.exports = (app, deps) => {
     return (data || []).reduce((a, d) => { a[d.folder_id] = (a[d.folder_id] || 0) + 1; return a }, {})
   }
   app.get('/calidad/carpetas', auth(STAFF), hx(async (req, res) => {
-    const [folders, counts, services] = await Promise.all([loadFolders(), docCounts(req), servicesFor(req)])
+    const area = areaOf(req); checkArea(req, area)
+    const [folders, counts, services] = await Promise.all([loadFolders(area), docCounts(req), servicesFor(req)])
     const sid = serviceParam(req.query.servicio)
-    const visible = folders.filter((f) => (f.active || req.user.role === 'administrador') && inService(f, sid) && (f.service_id == null || services.some((s) => s.id === f.service_id)))
+    const visible = folders.filter((f) => (f.active || req.user.role === 'administrador') && inService(f, sid) && (scopeId(f) == null || services.some((s) => s.id === scopeId(f))))
     res.send({ kinds: KINDS, categories: CATEGORIES, maxLevel: MAX_LEVEL, maxSize: MAX, types: TYPES, services, folders: visible.map((f) => folderDTO(f, folders, counts)) })
   }))
-  const folderRow = async (b, current) => {
+  const folderRow = async (b, current, areaIn = 'calidad') => {
     const name = clean(b.name)
     if (!name) throw httpError(400, 'Escribe el nombre de la carpeta')
     const parentId = current ? current.parent_id : Number(b.parentId) || null
     let level = 1
+    let area = current ? current.area : areaIn
     let serviceId = current ? current.service_id ?? null : null
+    let programId = current ? current.edu_program_id ?? null : null
     if (parentId) {
-      const { data: parent } = await supabase.from('qdoc_folders').select('id, level, service_id').eq('id', parentId).maybeSingle()
+      const { data: parent } = await supabase.from('qdoc_folders').select('id, level, service_id, area, edu_program_id').eq('id', parentId).maybeSingle()
       if (!parent) throw httpError(404, 'Carpeta superior no encontrada')
       level = parent.level + 1
       if (level > MAX_LEVEL) throw httpError(400, `Solo se permiten carpetas hasta el ${MAX_LEVEL}.er nivel`)
-      serviceId = parent.service_id ?? null
+      serviceId = parent.service_id ?? null; programId = parent.edu_program_id ?? null; area = parent.area
     } else if (!current) {
-      // Ítem principal nuevo: va a los generales o al árbol del servicio elegido.
-      serviceId = Number(b.serviceId) || null
-      if (serviceId) {
-        const { data: svc } = await supabase.from('ips_services').select('id').eq('id', serviceId).maybeSingle()
+      // Ítem principal nuevo: va a los generales (institucional) o al árbol del servicio (o programa) elegido.
+      const scope = Number(b.serviceId) || null
+      if (scope && area === 'educacion') {
+        const { data: prog } = await supabase.from('edu_programs').select('id').eq('id', scope).maybeSingle()
+        if (!prog) throw httpError(404, 'Programa no encontrado')
+        programId = scope
+      } else if (scope) {
+        const { data: svc } = await supabase.from('ips_services').select('id').eq('id', scope).maybeSingle()
         if (!svc) throw httpError(404, 'Servicio no encontrado')
+        serviceId = scope
       }
     }
     if (level === 1 && b.kind && !KINDS.includes(b.kind)) throw httpError(400, 'Tipo de ítem inválido')
-    return { parent_id: parentId, level, service_id: serviceId, name: name.slice(0, 160), code: clean(b.code), kind: level === 1 ? (b.kind || 'Otro') : null, description: clean(b.description), sort_order: Number(b.sortOrder) || 0, active: b.active !== false, updated_at: new Date().toISOString() }
+    return { parent_id: parentId, level, area, service_id: area === 'educacion' ? null : serviceId, edu_program_id: area === 'educacion' ? programId : null, name: name.slice(0, 160), code: clean(b.code), kind: level === 1 ? (b.kind || 'Otro') : null, description: clean(b.description), sort_order: Number(b.sortOrder) || 0, active: b.active !== false, updated_at: new Date().toISOString() }
   }
   app.post('/calidad/carpetas', auth(ADMIN), hx(async (req, res) => {
-    const row = await folderRow(req.body || {})
+    const row = await folderRow(req.body || {}, null, areaOf(req))
     const { data, error } = await supabase.from('qdoc_folders').insert({ ...row, created_by: req.user.id }).select('*').single()
     if (error) { if (error.code === '23505') throw httpError(409, 'Ya existe una carpeta con ese nombre en ese lugar'); throw error }
     res.status(201).send(data)
@@ -141,7 +162,7 @@ module.exports = (app, deps) => {
   const docDTO = (d, folders) => {
     const path = folders ? pathOf(folders, d.folder_id) : []
     return {
-      id: d.id, folderId: d.folder_id, serviceId: path[0]?.service_id ?? null, folderPath: path.map((p) => p.name).join(' / '), rootName: path[0]?.name ?? null, kind: path[0]?.kind ?? null,
+      id: d.id, folderId: d.folder_id, serviceId: path[0] ? scopeId(path[0]) : null, folderPath: path.map((p) => p.name).join(' / '), rootName: path[0]?.name ?? null, kind: path[0]?.kind ?? null,
       siteId: d.site_id, siteName: d.site?.name ?? null, name: d.name, category: d.category, code: d.code, version: d.version, observations: d.observations,
       validUntil: d.valid_until, validity: validity(d.valid_until), daysLeft: d.valid_until ? daysUntil(d.valid_until) : null,
       fileUrl: d.file_url, fileName: d.file_name, fileType: d.file_type, fileExt: TYPES[d.file_type], fileSize: d.file_size,
@@ -159,9 +180,10 @@ module.exports = (app, deps) => {
   }
   const siteFor = (req, v) => (req.user.role !== 'administrador' ? req.user.site_id : (v === '' || v == null || v === 'general' ? null : Number(v) || null))
   app.get('/calidad/documentos', auth(STAFF), hx(async (req, res) => {
-    const [all, services] = await Promise.all([loadFolders(), servicesFor(req)])
-    // Solo carpetas generales o de servicios que el usuario puede ver.
-    const folders = all.filter((f) => { const root = pathOf(all, f.id)[0]; return root?.service_id == null || services.some((s) => s.id === root.service_id) })
+    const area = areaOf(req); checkArea(req, area)
+    const [all, services] = await Promise.all([loadFolders(area), servicesFor(req)])
+    // Solo carpetas generales o de servicios (o programas) que el usuario puede ver.
+    const folders = all.filter((f) => { const root = pathOf(all, f.id)[0]; return root == null || scopeId(root) == null || services.some((s) => s.id === scopeId(root)) })
     let q = supabase.from('qdoc_documents').select(SELECT).order('name')
     const site = scopeSite(req)
     if (site) q = q.or(`site_id.is.null,site_id.eq.${site}`)
@@ -182,16 +204,21 @@ module.exports = (app, deps) => {
   const loadDoc = async (req) => {
     const { data } = await supabase.from('qdoc_documents').select(SELECT).eq('id', Number(req.params.id)).maybeSingle()
     if (!data || (data.site_id && !canAccessSite(req, data.site_id))) throw httpError(404, 'Documento no encontrado')
+    const { data: folder } = await supabase.from('qdoc_folders').select('area').eq('id', data.folder_id).maybeSingle()
+    checkArea(req, folder?.area || 'calidad')
     return data
   }
   app.post('/calidad/documentos', auth(STAFF), hx(async (req, res) => {
     const r = docRow(req.body || {})
+    const { data: target } = await supabase.from('qdoc_folders').select('area').eq('id', r.folder_id).maybeSingle()
+    if (!target) return fail(res, 'Carpeta no encontrada', 404)
+    checkArea(req, target.area)
     const isHtml = req.body?.kind === 'html'
     if (!isHtml && !req.body?.file) return fail(res, 'Carga el archivo del documento', 400)
     const f = isHtml ? htmlFields(r.name, req.body.contentHtml, httpError) : await upload(req.body.file)
     const { data, error } = await supabase.from('qdoc_documents').insert({ ...r, ...f, site_id: siteFor(req, req.body.siteId), created_by: req.user.id, updated_by: req.user.id }).select(SELECT).single()
     if (error) { await remove(f.file_path); throw error }
-    res.status(201).send(docDTO(data, await loadFolders()))
+    res.status(201).send(docDTO(data, await loadFolders(target.area)))
   }))
   app.put('/calidad/documentos/:id', auth(STAFF), hx(async (req, res) => {
     const cur = await loadDoc(req)
@@ -202,7 +229,8 @@ module.exports = (app, deps) => {
     const { data, error } = await supabase.from('qdoc_documents').update(upd).eq('id', cur.id).select(SELECT).single()
     if (error) { if (f) await remove(f.file_path); throw error }
     if (f) await remove(cur.file_path)
-    res.send(docDTO(data, await loadFolders()))
+    const { data: fo } = await supabase.from('qdoc_folders').select('area').eq('id', data.folder_id).maybeSingle()
+    res.send(docDTO(data, await loadFolders(fo?.area || 'calidad')))
   }))
   app.delete('/calidad/documentos/:id', auth(STAFF), hx(async (req, res) => {
     const cur = await loadDoc(req)
@@ -215,10 +243,11 @@ module.exports = (app, deps) => {
 
   // ---------------------------------------------------------------- Dashboard
   app.get('/calidad/resumen', auth(STAFF), hx(async (req, res) => {
-    const [allFolders, services] = await Promise.all([loadFolders(), servicesFor(req)])
+    const area = areaOf(req); checkArea(req, area)
+    const [allFolders, services] = await Promise.all([loadFolders(area), servicesFor(req)])
     const sid = serviceParam(req.query.servicio)
-    const known = (f) => f.service_id == null || services.some((s) => s.id === f.service_id)
-    let q = supabase.from('qdoc_documents').select(SELECT).order('created_at', { ascending: false })
+    const known = (f) => scopeId(f) == null || services.some((s) => s.id === scopeId(f))
+    let q = supabase.from('qdoc_documents').select(SELECT).in('folder_id', allFolders.map((f) => f.id).concat(0)).order('created_at', { ascending: false })
     const site = scopeSite(req)
     if (site) q = q.or(`site_id.is.null,site_id.eq.${site}`)
     const { data, error } = await q
@@ -234,14 +263,14 @@ module.exports = (app, deps) => {
       }
     }
     const scopeOf = (s) => { const fs = allFolders.filter((f) => known(f) && inService(f, s)); const ids = new Set(fs.map((f) => f.id)); return { fs, ds: allDocs.filter((d) => ids.has(d.folderId)) } }
-    const byService = [{ id: null, name: 'Generales', code: 'general' }, ...services].map((s) => { const { fs, ds } = scopeOf(s.id); return { id: s.id, code: s.code, name: s.name, ...summarize(fs, ds) } })
+    const byService = [{ id: null, name: area === 'educacion' ? 'Institucional' : 'Generales', code: 'general' }, ...services].map((s) => { const { fs, ds } = scopeOf(s.id); return { id: s.id, code: s.code, name: s.name, ...summarize(fs, ds) } })
     const { fs: folders, ds: docs } = scopeOf(sid)
     const roots = folders.filter((f) => f.level === 1 && f.active)
     const byItem = roots.map((r) => {
       const ids = descendants(folders, r.id)
       const list = docs.filter((d) => ids.includes(d.folderId))
       const subs = folders.filter((f) => ids.includes(f.id) && f.id !== r.id)
-      return { id: r.id, serviceId: r.service_id ?? null, code: r.code, name: r.name, kind: r.kind, documentos: list.length, carpetas: subs.length, carpetasVacias: subs.filter((s) => !docs.some((d) => d.folderId === s.id) && !folders.some((x) => x.parent_id === s.id)).length, vencidos: list.filter((d) => d.validity === 'vencido').length, porVencer: list.filter((d) => d.validity === 'por_vencer').length }
+      return { id: r.id, serviceId: scopeId(r), code: r.code, name: r.name, kind: r.kind, documentos: list.length, carpetas: subs.length, carpetasVacias: subs.filter((s) => !docs.some((d) => d.folderId === s.id) && !folders.some((x) => x.parent_id === s.id)).length, vencidos: list.filter((d) => d.validity === 'vencido').length, porVencer: list.filter((d) => d.validity === 'por_vencer').length }
     })
     const byType = Object.entries(FILE_GROUPS).map(([k, exts]) => ({ name: { pdf: 'PDF', imagen: 'Imagen', word: 'Word', excel: 'Excel', html: 'En línea' }[k], value: docs.filter((d) => exts.includes(d.fileExt)).length }))
     res.send({
