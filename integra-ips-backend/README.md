@@ -79,3 +79,10 @@ Imágenes en Supabase Storage: buckets `avatars` y `branding`.
 - Cada usuario guarda su firma (`users.signature_url`, bucket `signatures`): dibujada en pantalla o imagen PNG/JPG con fondo blanco o SVG. `PUT/DELETE /firma`; el administrador gestiona la de cualquier usuario en `/firmas/usuarios`.
 - `document_signatures` guarda las firmas estampadas (tipo, clave del documento, casilla, copia de la imagen y del nombre, fecha). `GET /firmas?tipo=&clave=`, `POST /firmas`, `DELETE /firmas/:id` (quien firmó o admin).
 - Reglas por documento: citología (quien elaboró / tomó la muestra), evento (coordinador; dirección), reporte vehicular y preoperacional (el conductor del registro; revisó = administrador), reportes de temperatura e inventario y hoja de vida de equipos (personal de la sede).
+
+## Recordatorio de temperatura por Telegram (Supabase)
+30 minutos después de cada hora de toma (Temperatura → Recordatorios), si esa lectura aún no está registrada en una sede, se avisa al grupo de Telegram de la sección "temperatura" de la sede. Corre en Supabase, no en este backend, así que funciona aunque la API esté apagada.
+- `supabase/functions/recordatorio-temperatura`: edge function (sin JWT; valida la cabecera `x-cron-secret` contra el secreto `temp_reminder_cron_secret` de Vault).
+- `supabase/migrations/20261114_recordatorio_temperatura_telegram.sql`: activa pg_cron y pg_net, crea `temperature_reminders_sent` (un aviso por sede, día y lectura) y programa la tarea `recordatorio-temperatura` cada 5 minutos.
+- Prueba sin enviar: POST con body `{ "dry": true, "now": "08:31", "date": "AAAA-MM-DD" }` y la misma cabecera.
+- Para pausarlo: apaga los recordatorios en Temperatura → Recordatorios, o `select cron.unschedule('recordatorio-temperatura');`.
