@@ -3,6 +3,8 @@
 // · Ítems principales configurables (nivel 1, con su tipo) y carpetas internas hasta el 3.er nivel.
 // · En cualquier carpeta se cargan documentos y formatos (PDF, imágenes, Word, Excel) como en Procesos prioritarios.
 // · Filtros por ítem principal, tipo de ítem, tipo de archivo y texto; resumen para el dashboard.
+// · Cada servicio de IPS tiene su propio árbol (qdoc_folders.service_id); sin servicio = documentos generales.
+//   Las subcarpetas heredan el servicio de su ítem principal. Filtro: ?servicio=general | <id> (sin él, todos).
 // =====================================================================
 const crypto = require('crypto')
 const { htmlFields } = require('./htmldoc')
@@ -42,6 +44,19 @@ module.exports = (app, deps) => {
   const daysUntil = (iso) => Math.round((toUTC(iso) - toUTC(todayBogota())) / 86400000)
   const validity = (iso) => (!iso ? null : daysUntil(iso) < 0 ? 'vencido' : daysUntil(iso) <= WARN_DAYS ? 'por_vencer' : 'vigente')
 
+  // ---------------------------------------------------------------- Servicios
+  // Servicios de IPS activos que el usuario puede ver: el administrador, todos (o los de la sede elegida);
+  // el empleado, los habilitados en su sede.
+  const servicesFor = async (req) => {
+    const { data, error } = await supabase.from('ips_services').select('id, code, name, module, site_services(site_id)').eq('active', true).order('name')
+    if (error) throw error
+    const site = scopeSite(req)
+    return data.filter((s) => !site || (s.site_services || []).some((x) => Number(x.site_id) === Number(site))).map((s) => ({ id: s.id, code: s.code, name: s.name, module: s.module }))
+  }
+  // ?servicio=general → null (generales); ?servicio=<id> → ese servicio; sin parámetro → undefined (todos).
+  const serviceParam = (v) => (v === 'general' ? null : Number(v) || undefined)
+  const inService = (f, sid) => sid === undefined || (f.service_id ?? null) === sid
+
   // ---------------------------------------------------------------- Carpetas
   const loadFolders = async () => {
     const { data, error } = await supabase.from('qdoc_folders').select('*').order('level').order('sort_order').order('name')
@@ -54,7 +69,7 @@ module.exports = (app, deps) => {
   const folderDTO = (f, folders, counts) => {
     const path = pathOf(folders, f.id)
     return {
-      id: f.id, parentId: f.parent_id, level: f.level, code: f.code, name: f.name, kind: path[0]?.kind ?? null, rootId: path[0]?.id ?? f.id, description: f.description, sortOrder: f.sort_order, active: f.active,
+      id: f.id, parentId: f.parent_id, level: f.level, serviceId: f.service_id ?? null, code: f.code, name: f.name, kind: path[0]?.kind ?? null, rootId: path[0]?.id ?? f.id, description: f.description, sortOrder: f.sort_order, active: f.active,
       path: path.map((p) => ({ id: p.id, name: p.name, code: p.code })),
       docs: counts[f.id] || 0, totalDocs: descendants(folders, f.id).reduce((a, x) => a + (counts[x] || 0), 0)
     }
@@ -67,22 +82,33 @@ module.exports = (app, deps) => {
     return (data || []).reduce((a, d) => { a[d.folder_id] = (a[d.folder_id] || 0) + 1; return a }, {})
   }
   app.get('/calidad/carpetas', auth(STAFF), hx(async (req, res) => {
-    const [folders, counts] = await Promise.all([loadFolders(), docCounts(req)])
-    res.send({ kinds: KINDS, categories: CATEGORIES, maxLevel: MAX_LEVEL, maxSize: MAX, types: TYPES, folders: folders.filter((f) => f.active || req.user.role === 'administrador').map((f) => folderDTO(f, folders, counts)) })
+    const [folders, counts, services] = await Promise.all([loadFolders(), docCounts(req), servicesFor(req)])
+    const sid = serviceParam(req.query.servicio)
+    const visible = folders.filter((f) => (f.active || req.user.role === 'administrador') && inService(f, sid) && (f.service_id == null || services.some((s) => s.id === f.service_id)))
+    res.send({ kinds: KINDS, categories: CATEGORIES, maxLevel: MAX_LEVEL, maxSize: MAX, types: TYPES, services, folders: visible.map((f) => folderDTO(f, folders, counts)) })
   }))
   const folderRow = async (b, current) => {
     const name = clean(b.name)
     if (!name) throw httpError(400, 'Escribe el nombre de la carpeta')
     const parentId = current ? current.parent_id : Number(b.parentId) || null
     let level = 1
+    let serviceId = current ? current.service_id ?? null : null
     if (parentId) {
-      const { data: parent } = await supabase.from('qdoc_folders').select('id, level').eq('id', parentId).maybeSingle()
+      const { data: parent } = await supabase.from('qdoc_folders').select('id, level, service_id').eq('id', parentId).maybeSingle()
       if (!parent) throw httpError(404, 'Carpeta superior no encontrada')
       level = parent.level + 1
       if (level > MAX_LEVEL) throw httpError(400, `Solo se permiten carpetas hasta el ${MAX_LEVEL}.er nivel`)
+      serviceId = parent.service_id ?? null
+    } else if (!current) {
+      // Ítem principal nuevo: va a los generales o al árbol del servicio elegido.
+      serviceId = Number(b.serviceId) || null
+      if (serviceId) {
+        const { data: svc } = await supabase.from('ips_services').select('id').eq('id', serviceId).maybeSingle()
+        if (!svc) throw httpError(404, 'Servicio no encontrado')
+      }
     }
     if (level === 1 && b.kind && !KINDS.includes(b.kind)) throw httpError(400, 'Tipo de ítem inválido')
-    return { parent_id: parentId, level, name: name.slice(0, 160), code: clean(b.code), kind: level === 1 ? (b.kind || 'Otro') : null, description: clean(b.description), sort_order: Number(b.sortOrder) || 0, active: b.active !== false, updated_at: new Date().toISOString() }
+    return { parent_id: parentId, level, service_id: serviceId, name: name.slice(0, 160), code: clean(b.code), kind: level === 1 ? (b.kind || 'Otro') : null, description: clean(b.description), sort_order: Number(b.sortOrder) || 0, active: b.active !== false, updated_at: new Date().toISOString() }
   }
   app.post('/calidad/carpetas', auth(ADMIN), hx(async (req, res) => {
     const row = await folderRow(req.body || {})
@@ -115,7 +141,7 @@ module.exports = (app, deps) => {
   const docDTO = (d, folders) => {
     const path = folders ? pathOf(folders, d.folder_id) : []
     return {
-      id: d.id, folderId: d.folder_id, folderPath: path.map((p) => p.name).join(' / '), rootName: path[0]?.name ?? null, kind: path[0]?.kind ?? null,
+      id: d.id, folderId: d.folder_id, serviceId: path[0]?.service_id ?? null, folderPath: path.map((p) => p.name).join(' / '), rootName: path[0]?.name ?? null, kind: path[0]?.kind ?? null,
       siteId: d.site_id, siteName: d.site?.name ?? null, name: d.name, category: d.category, code: d.code, version: d.version, observations: d.observations,
       validUntil: d.valid_until, validity: validity(d.valid_until), daysLeft: d.valid_until ? daysUntil(d.valid_until) : null,
       fileUrl: d.file_url, fileName: d.file_name, fileType: d.file_type, fileExt: TYPES[d.file_type], fileSize: d.file_size,
@@ -133,12 +159,16 @@ module.exports = (app, deps) => {
   }
   const siteFor = (req, v) => (req.user.role !== 'administrador' ? req.user.site_id : (v === '' || v == null || v === 'general' ? null : Number(v) || null))
   app.get('/calidad/documentos', auth(STAFF), hx(async (req, res) => {
-    const folders = await loadFolders()
+    const [all, services] = await Promise.all([loadFolders(), servicesFor(req)])
+    // Solo carpetas generales o de servicios que el usuario puede ver.
+    const folders = all.filter((f) => { const root = pathOf(all, f.id)[0]; return root?.service_id == null || services.some((s) => s.id === root.service_id) })
     let q = supabase.from('qdoc_documents').select(SELECT).order('name')
     const site = scopeSite(req)
     if (site) q = q.or(`site_id.is.null,site_id.eq.${site}`)
     const folderId = Number(req.query.carpeta) || Number(req.query.item) || null
-    if (folderId) q = q.in('folder_id', req.query.subcarpetas === '0' ? [folderId] : descendants(folders, folderId))
+    const sid = serviceParam(req.query.servicio)
+    if (folderId) q = q.in('folder_id', (req.query.subcarpetas === '0' ? [folderId] : descendants(folders, folderId)).filter((id) => folders.some((f) => f.id === id)).concat(0))
+    else q = q.in('folder_id', folders.filter((f) => inService(f, sid)).map((f) => f.id).concat(0))
     if (clean(req.query.categoria)) q = q.eq('category', clean(req.query.categoria))
     const { data, error } = await q
     if (error) throw error
@@ -185,24 +215,38 @@ module.exports = (app, deps) => {
 
   // ---------------------------------------------------------------- Dashboard
   app.get('/calidad/resumen', auth(STAFF), hx(async (req, res) => {
-    const folders = await loadFolders()
+    const [allFolders, services] = await Promise.all([loadFolders(), servicesFor(req)])
+    const sid = serviceParam(req.query.servicio)
+    const known = (f) => f.service_id == null || services.some((s) => s.id === f.service_id)
     let q = supabase.from('qdoc_documents').select(SELECT).order('created_at', { ascending: false })
     const site = scopeSite(req)
     if (site) q = q.or(`site_id.is.null,site_id.eq.${site}`)
     const { data, error } = await q
     if (error) throw error
-    const docs = data.map((d) => docDTO(d, folders))
+    const allDocs = data.map((d) => docDTO(d, allFolders))
+    // Resumen por servicio (siempre completo, para comparar) y el detalle del servicio elegido.
+    const summarize = (fs, ds) => {
+      const subs = fs.filter((f) => f.level > 1)
+      return {
+        documentos: ds.length, items: fs.filter((f) => f.level === 1 && f.active).length, carpetas: subs.length,
+        sinCargar: subs.filter((s) => !ds.some((d) => d.folderId === s.id) && !fs.some((x) => x.parent_id === s.id)).length,
+        vencidos: ds.filter((d) => d.validity === 'vencido').length, porVencer: ds.filter((d) => d.validity === 'por_vencer').length
+      }
+    }
+    const scopeOf = (s) => { const fs = allFolders.filter((f) => known(f) && inService(f, s)); const ids = new Set(fs.map((f) => f.id)); return { fs, ds: allDocs.filter((d) => ids.has(d.folderId)) } }
+    const byService = [{ id: null, name: 'Generales', code: 'general' }, ...services].map((s) => { const { fs, ds } = scopeOf(s.id); return { id: s.id, code: s.code, name: s.name, ...summarize(fs, ds) } })
+    const { fs: folders, ds: docs } = scopeOf(sid)
     const roots = folders.filter((f) => f.level === 1 && f.active)
     const byItem = roots.map((r) => {
       const ids = descendants(folders, r.id)
       const list = docs.filter((d) => ids.includes(d.folderId))
       const subs = folders.filter((f) => ids.includes(f.id) && f.id !== r.id)
-      return { id: r.id, code: r.code, name: r.name, kind: r.kind, documentos: list.length, carpetas: subs.length, carpetasVacias: subs.filter((s) => !docs.some((d) => d.folderId === s.id) && !folders.some((x) => x.parent_id === s.id)).length, vencidos: list.filter((d) => d.validity === 'vencido').length, porVencer: list.filter((d) => d.validity === 'por_vencer').length }
+      return { id: r.id, serviceId: r.service_id ?? null, code: r.code, name: r.name, kind: r.kind, documentos: list.length, carpetas: subs.length, carpetasVacias: subs.filter((s) => !docs.some((d) => d.folderId === s.id) && !folders.some((x) => x.parent_id === s.id)).length, vencidos: list.filter((d) => d.validity === 'vencido').length, porVencer: list.filter((d) => d.validity === 'por_vencer').length }
     })
     const byType = Object.entries(FILE_GROUPS).map(([k, exts]) => ({ name: { pdf: 'PDF', imagen: 'Imagen', word: 'Word', excel: 'Excel', html: 'En línea' }[k], value: docs.filter((d) => exts.includes(d.fileExt)).length }))
     res.send({
       kpis: { documentos: docs.length, items: roots.length, carpetas: folders.filter((f) => f.level > 1).length, vencidos: docs.filter((d) => d.validity === 'vencido').length, porVencer: docs.filter((d) => d.validity === 'por_vencer').length, sinCargar: byItem.reduce((a, x) => a + x.carpetasVacias, 0) },
-      byItem, byType,
+      services, byService, byItem, byType,
       expiring: docs.filter((d) => d.validity && d.validity !== 'vigente').sort((a, b) => a.daysLeft - b.daysLeft).slice(0, 8),
       recent: docs.slice(0, 8)
     })
