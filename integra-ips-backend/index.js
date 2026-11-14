@@ -13,6 +13,14 @@ const platform = require('./platform')
 let legal = null // documentos legales: se registra más abajo
 // Rutas permitidas mientras el contrato y el acuerdo de datos no estén firmados.
 const LEGAL_ALLOW = ['/auth/me', '/legal', '/firma', '/configuracion', '/plan', '/perfil']
+// El estudiante (portal de Académico ETDH) solo usa su sesión, su perfil, su firma, los documentos legales y su portal.
+// Cualquier otra ruta se le niega aunque el endpoint esté abierto a todos los roles (auth() sin roles).
+const STUDENT_ALLOW = ['/auth/me', '/mis-notificaciones', '/legal', '/firma', '/configuracion', '/perfil', '/academico/mi-programa', '/academico/catalogos', '/academico/mi-asistencia', '/academico/mis-clases', '/academico/mi-aula', '/academico/mis-certificados']
+// Docente (Académico ETDH): su panel, sus clases y lo básico de la cuenta.
+const TEACHER_ALLOW = ['/auth/me', '/mis-notificaciones', '/legal', '/firma', '/configuracion', '/perfil', '/academico/docente', '/academico/catalogos', '/academico/mis-clases']
+const TEACHER_ALLOW_RE = [/^\/academico\/grupos\/\d+\/(aula|notas|evaluaciones|materiales)$/, /^\/academico\/materiales\/\d+(\/entregas)?$/, /^\/academico\/entregas\/\d+\/calificar$/, /^\/academico\/evaluaciones\/\d+$/, /^\/academico\/clases\/\d+$/, /^\/academico\/clases\/\d+\/asistencia(\/[a-z0-9-]+){0,2}$/, /^\/academico\/grupos\/\d+\/asistencia$/]
+// Rutas exactas del portal: su contrato (ver y firmar), sus recibos y el reglamento. Cada endpoint valida que la matrícula sea suya.
+const STUDENT_ALLOW_RE = [/^\/academico\/certificados\/\d+$/, /^\/academico\/materiales\/\d+\/entregar$/, /^\/academico\/matriculas\/\d+\/contrato(\/firmar)?$/, /^\/academico\/matriculas\/\d+\/factura$/, /^\/academico\/pagos\/\d+$/, /^\/academico\/configuracion$/]
 
 const {
   SUPABASE_URL, SUPABASE_SECRET_KEY, JWT_SECRET,
@@ -58,7 +66,7 @@ app.use(express.json({ limit: '25mb' })) // imágenes en base64 (foto de perfil 
 
 const TZ = 'America/Bogota'
 const TZ_OFFSET = '-05:00' // Colombia no tiene horario de verano
-const ROLES = ['administrador', 'empleado', 'conductor', 'voluntario']
+const ROLES = ['administrador', 'empleado', 'conductor', 'voluntario', 'estudiante', 'docente']
 const ADMIN = ['administrador']
 const STAFF = ['administrador', 'empleado']
 const ALL = ROLES
@@ -71,11 +79,13 @@ const IPS_MODULES = ['cadena_frio', 'citologia', 'ambulancias'] // módulos del 
 // Módulos por usuario: el administrador puede mostrar u ocultar módulos a cada usuario.
 // users.modules = null usa los del rol; un arreglo los reemplaza. El administrador ve todo.
 // ======================================================================
-const MODULE_KEYS = ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales']
+const MODULE_KEYS = ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes', 'edu_portal', 'edu_docente']
 const ROLE_MODULES = {
-  empleado: ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales'],
+  empleado: ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes'],
   voluntario: ['socorro', 'educacion', 'voluntario'],
   conductor: ['flota', 'traslado'],
+  estudiante: ['edu_portal'], // Académico ETDH: portal del estudiante
+  docente: ['edu_docente'], // Académico ETDH: panel del docente
   administrador: MODULE_KEYS
 }
 // El plan contratado (plataforma) limita los módulos de todos, incluido el administrador.
@@ -86,12 +96,17 @@ const userModules = (u) => (u.role === 'administrador' ? MODULE_KEYS : Array.isA
 // Ruta → módulo (el primero que coincide). Las rutas sin módulo solo dependen del rol.
 const ROUTE_MODULES = [
   ['/citologias', ['citologias']], ['/registrar-toma-de-muestras-citologicas', ['citologias']], ['/consultar-citologias', ['citologias']],
-  ['/facturacion', ['facturacion']], ['/calidad', ['doc_generales']], ['/vacunacion', ['vacunacion']],
+  ['/facturacion', ['facturacion']], ['/calidad', ['doc_generales', 'edu_programas', 'edu_dashboard', 'edu_estudiantes']], ['/vacunacion', ['vacunacion']],
   ['/registrar-temperatura', ['temperatura']], ['/reporte-temperatura', ['temperatura']], ['/temperatura', ['temperatura']],
   ['/ambulancias-dashboard', ['traslado']], ['/equipos', ['equipos']], ['/dashboard', ['ips_dashboard']],
   ['/estandares/th', ['talento_humano']], ['/estandares/documentos/procesos_prioritarios', ['procesos_prioritarios']], ['/estandares/documentos/interdependencia', ['interdependencia']], ['/estandares/documentos/medicamentos', ['medicamentos']], ['/estandares/documentos/infraestructura', ['infraestructura']], ['/estandares/documentos/historia_clinica', ['historia_clinica']], ['/socorro/dashboard', ['og_dashboard']], ['/socorro/reporte-voluntarios', ['reporte_voluntarios']], ['/socorro/eventos', ['socorro', 'educacion']], ['/socorro/inventario', ['socorro', 'educacion']],
   ['/socorro/personas', ['personas', 'socorro', 'educacion']], ['/inventario', ['inventario']], ['/voluntario/panel', ['voluntario']],
-  ['/vehiculos', ['flota', 'traslado']]
+  ['/vehiculos', ['flota', 'traslado']],
+  ['/academico/resumen', ['edu_dashboard']], ['/academico/programas', ['edu_programas', 'edu_estudiantes']], ['/academico/grupos', ['edu_programas', 'edu_estudiantes', 'edu_docente']],
+  ['/academico/estudiantes', ['edu_estudiantes']], ['/academico/matriculas', ['edu_estudiantes', 'edu_portal']], ['/academico/pagos', ['edu_estudiantes', 'edu_portal']], ['/academico/mi-programa', ['edu_portal']], ['/academico/mis-clases', ['edu_portal', 'edu_docente']], ['/academico/mi-asistencia', ['edu_portal']], ['/academico/mi-aula', ['edu_portal']], ['/academico/mis-certificados', ['edu_portal']], ['/academico/certificados', ['edu_estudiantes', 'edu_portal']], ['/academico/reportes', ['edu_dashboard', 'edu_estudiantes', 'edu_programas']], ['/academico/materiales', ['edu_programas', 'edu_docente', 'edu_portal']], ['/academico/entregas', ['edu_programas', 'edu_docente']], ['/academico/evaluaciones', ['edu_programas', 'edu_docente']], ['/academico/actas', ['edu_programas', 'edu_estudiantes']],
+  ['/academico/horarios', ['edu_programas']], ['/academico/aulas', ['edu_programas']], ['/academico/clases', ['edu_programas', 'edu_docente']], ['/academico/docente', ['edu_docente']], ['/academico/docentes', ['edu_programas']], ['/academico/telegram', ['edu_programas']],
+  ['/academico/cartera', ['edu_estudiantes']], ['/academico/descuentos', ['edu_estudiantes', 'edu_programas']], ['/academico/planes-pago', ['edu_estudiantes', 'edu_programas']], ['/academico/convenios', ['edu_estudiantes', 'edu_programas']], ['/academico/configuracion', ['edu_dashboard', 'edu_programas', 'edu_estudiantes', 'edu_portal']],
+  ['/academico/catalogos', ['edu_dashboard', 'edu_programas', 'edu_estudiantes', 'edu_portal']]
 ]
 const routeModules = (path) => (ROUTE_MODULES.find(([p]) => path === p || path.startsWith(`${p}/`) || path.startsWith(`${p}-`)) || [])[1] || null
 const GRANTABLE_ROLES = ['empleado', 'voluntario'] // roles de endpoints que se abren a quien tenga el módulo
@@ -219,6 +234,8 @@ const authorize = async (req, res, next, roles, user) => {
   try {
     // Permisos: rol del endpoint + módulos del usuario.
     const mods = routeModules(req.path)
+    if (user.role === 'docente' && !roles.includes('docente') && !TEACHER_ALLOW.some((p) => req.path === p || req.path.startsWith(`${p}/`)) && !TEACHER_ALLOW_RE.some((r) => r.test(req.path))) return fail(res, 'No tienes permiso para esta acción', 403)
+    if (user.role === 'estudiante' && !roles.includes('estudiante') && !STUDENT_ALLOW.some((p) => req.path === p || req.path.startsWith(`${p}/`)) && !STUDENT_ALLOW_RE.some((r) => r.test(req.path))) return fail(res, 'No tienes permiso para esta acción', 403)
     if (mods && !mods.some(inPlan)) return fail(res, 'Tu plan no incluye este módulo. Consulta las opciones de plan con el proveedor.', 403)
     if (legal && !LEGAL_ALLOW.some((p) => req.path === p || req.path.startsWith(`${p}/`))) {
       const st = await legal.current()
@@ -746,6 +763,7 @@ const getSettings = async () => {
     primaryColor: s.primary_color,
     secondaryColor: s.secondary_color,
     logoUrl: s.logo_url,
+    eduLogoUrl: s.edu_logo_url ?? null,
     loginImageUrl: s.login_image_url,
     loginDescription: s.login_description,
     loginFooter: s.login_footer,
@@ -817,6 +835,24 @@ app.delete('/configuracion/login-imagen', auth(ADMIN), h(async (req, res) => {
   const { error } = await supabase.from('app_settings').update({ login_image_url: null, updated_at: new Date().toISOString() })
   if (error) throw error
   await removeStoredFile('branding', before.loginImageUrl)
+  res.send(await getSettings())
+}))
+
+// Logo del área de educación (Académico ETDH): si está vacío se usa el logo de la IPS.
+app.post('/configuracion/logo-educacion', auth(ADMIN), h(async (req, res) => {
+  const before = await getSettings()
+  const url = await uploadImage('branding', 'logo-edu', req.body?.image, ['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml'])
+  if (!url) return fail(res, 'Imagen inválida (PNG, JPG, WEBP o SVG de máximo 2 MB)', 400)
+  const { error } = await supabase.from('app_settings').update({ edu_logo_url: url, updated_at: new Date().toISOString() })
+  if (error) throw error
+  await removeStoredFile('branding', before.eduLogoUrl)
+  res.send(await getSettings())
+}))
+app.delete('/configuracion/logo-educacion', auth(ADMIN), h(async (req, res) => {
+  const before = await getSettings()
+  const { error } = await supabase.from('app_settings').update({ edu_logo_url: null, updated_at: new Date().toISOString() })
+  if (error) throw error
+  await removeStoredFile('branding', before.eduLogoUrl)
   res.send(await getSettings())
 }))
 
@@ -1081,7 +1117,7 @@ const share = require('./share')(app, { supabase, auth, h, fail, clean, canAcces
 // Recordatorios de la siguiente dosis por correo y WhatsApp (tarea diaria, modo prueba).
 require('./reminders')(app, { supabase, auth, h, fail, clean, ADMIN, todayBogota, getSettings: () => getSettings(), share, TZ, hasFeature: (k) => hasFeature(k) })
 // Notificaciones por Telegram (grupos por sección).
-const notifier = require('./notify')(app, { supabase, auth, h, fail, clean, ADMIN, TZ, inPlan: (m) => inPlan(m), hasFeature: (k) => hasFeature(k) })
+const notifier = require('./notify')(app, { supabase, auth, h, fail, clean, ADMIN, TZ, inPlan: (m) => inPlan(m), hasFeature: (k) => hasFeature(k), userModules: (u) => userModules(u) })
 
 app.get('/citologias/datos-formulario', auth(STAFF), requireIps('citologia'), h(async (req, res) => {
   const [price, employees, last, lastSlide] = await Promise.all([
@@ -1372,7 +1408,8 @@ require('./equipment')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, t
 require('./talento')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
 require('./estandares')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
 // Calidad IPS · Documentos generales (ítems principales y carpetas hasta 3 niveles).
-require('./calidad')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite })
+require('./calidad')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, userHas: (u, m) => userModules(u).includes(m) })
+require('./academico')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, uploadImage, notifier: () => notifier })
 const plt = platform.register(app, { supabase, auth, h, fail, clean, JWT_SECRET, ISO_DATE, MODULE_KEYS })
 legal = require('./legal')(app, { supabase, auth, h, fail, clean, ADMIN, platform: plt, pauth: plt.pauth })
 require('./search')(app, { supabase, auth, h, fail, clean, userModules, ...SCOPE })

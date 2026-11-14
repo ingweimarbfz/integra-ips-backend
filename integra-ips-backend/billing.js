@@ -191,6 +191,15 @@ module.exports = (app, deps) => {
   // Todo servicio prestado queda como un cobro (service_charges) con sus ítems del tarifario y una factura FV- única.
   // Las citologías llegan "por facturar" desde su registro y se facturan aquí como los demás servicios.
   const discountAmount = (d, base) => Math.min(base, d.type === 'porcentaje' ? Math.round(base * Number(d.value) / 100) : Number(d.value))
+  // Último número usado del consecutivo de facturas: lo comparten IPS y Educación (matrículas y convenios).
+  const lastInvoiceUsed = async () => {
+    const digits = (n) => Number(String(n || '').replace(/\D/g, '')) || 0
+    const [{ data: sc }, { data: ed }] = await Promise.all([
+      supabase.from('service_charges').select('invoice_number').not('invoice_number', 'is', null).order('invoice_number', { ascending: false }).limit(1),
+      supabase.from('edu_enrollments').select('invoice_number, agreement_invoice_number').or('invoice_number.not.is.null,agreement_invoice_number.not.is.null').limit(5000)
+    ])
+    return Math.max(digits(sc?.[0]?.invoice_number), ...(ed || []).flatMap((x) => [digits(x.invoice_number), digits(x.agreement_invoice_number)]), 0)
+  }
   const nextInvoice = async () => { const { data, error } = await supabase.rpc('next_invoice_number'); if (error) throw error; return data }
   // Las citologías guardan su propio estado de cobro: se mantiene sincronizado.
   const syncSources = async (filter, patch) => {
@@ -249,8 +258,7 @@ module.exports = (app, deps) => {
   const taxDTO = (t) => Object.fromEntries(Object.entries(TAX_FIELDS).map(([k, col]) => [k, t[col]]))
   app.get('/facturacion/impuestos', auth(STAFF), hx(async (req, res) => {
     const t = await loadTax()
-    const { data: last } = await supabase.from('service_charges').select('invoice_number').not('invoice_number', 'is', null).order('invoice_number', { ascending: false }).limit(1)
-    const used = Number(String(last?.[0]?.invoice_number || '').replace(/\D/g, '')) || 0
+    const used = await lastInvoiceUsed()
     res.send({ ...taxDTO(t), lastInvoice: used, rangeLeft: t.dian_to ? t.dian_to - used : null })
   }))
   app.put('/facturacion/impuestos', auth(ADMIN), hx(async (req, res) => {
@@ -344,8 +352,7 @@ module.exports = (app, deps) => {
   const checkDianRange = async (tax) => {
     if (tax.dian_valid_until && tax.dian_valid_until < today()) throw httpError(409, 'La resolución de facturación DIAN está vencida: actualízala en Facturación → Impuestos y numeración')
     if (tax.dian_to) {
-      const { data: last } = await supabase.from('service_charges').select('invoice_number').not('invoice_number', 'is', null).order('invoice_number', { ascending: false }).limit(1)
-      const used = Number(String(last?.[0]?.invoice_number || '').replace(/\D/g, '')) || 0
+      const used = await lastInvoiceUsed()
       if (used >= tax.dian_to) throw httpError(409, 'Se agotó el rango de numeración autorizado por la DIAN: actualízalo en Facturación → Impuestos y numeración')
     }
   }
