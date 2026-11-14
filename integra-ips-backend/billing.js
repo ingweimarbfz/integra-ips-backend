@@ -553,6 +553,35 @@ module.exports = (app, deps) => {
     res.send({ ok: true })
   }))
 
+  // ---------------------------------------------------------------- Libro de facturas emitidas
+  // Todo el consecutivo FV: facturas de servicios de IPS y, si el módulo de Educación está activo, las de matrículas y convenios.
+  const PAY_LABEL = { no_aplica: ['Contado', 'ok'], pendiente: ['Pendiente de cuenta de cobro', 'warn'], cobrada: ['En cuenta de cobro', 'info'], pagada: ['Pagada', 'ok'], anulada: ['Anulada', 'bad'] }
+  app.get('/facturacion/facturas-emitidas', auth(STAFF), hx(async (req, res) => {
+    const from = ISO_DATE.test(req.query.desde || '') ? req.query.desde : null
+    const to = ISO_DATE.test(req.query.hasta || '') ? req.query.hasta : null
+    let q = supabase.from('service_charges').select('id, site_id, site:sites(name), service_id, service_name, description, service_date, invoice_number, invoiced_at, patient_name, patient_doc, payer_type, payer_name, payer_doc_type, payer_doc_number, valor_base, discount_amount, iva_amount, total_invoice, valor, payment_mode, billing_status, void_reason, eps:eps_insurers(name)')
+      .not('invoice_number', 'is', null).order('invoice_number', { ascending: false }).limit(5000)
+    const site = scopeSite(req)
+    if (site) q = q.eq('site_id', site)
+    const { data, error } = await q
+    if (error) throw error
+    const day = (r) => String(r.invoiced_at || r.service_date).slice(0, 10)
+    const ips = (data || []).filter((r) => (!from || day(r) >= from) && (!to || day(r) <= to)).map((r) => {
+      const [label, tone] = PAY_LABEL[r.billing_status] || [r.billing_status, '']
+      const payer = r.payer_type && r.payer_type !== 'paciente' ? r.payer_name : (r.patient_name || r.payer_name)
+      return {
+        key: `s${r.id}`, origin: 'ips', originLabel: 'IPS', kind: 'servicio', kindLabel: r.payment_mode === 'cuenta_cobro' ? (r.eps?.name ? `EPS · ${r.eps.name}` : 'Convenio') : 'Particular',
+        number: r.invoice_number, issuedAt: day(r), customer: payer || '—', customerDoc: r.payer_type && r.payer_type !== 'paciente' ? [r.payer_doc_type, r.payer_doc_number].filter(Boolean).join(' ') : (r.patient_doc || ''),
+        concept: [r.service_name, r.description].filter(Boolean).join(' · '), serviceId: r.service_id, site: r.site?.name || null,
+        subtotal: Number(r.valor_base || 0), discount: Number(r.discount_amount || 0), iva: Number(r.iva_amount || 0), total: r.billing_status === 'anulada' ? null : Number(r.total_invoice ?? r.valor),
+        status: r.billing_status === 'anulada' ? 'anulada' : 'vigente', voidReason: r.void_reason, payment: { label, tone }, href: `/facturacion/factura/${r.id}`
+      }
+    })
+    const withEdu = req.query.origen !== 'ips' && typeof req.app.locals.eduInvoices === 'function' && deps.inPlan && ['edu_estudiantes', 'edu_programas', 'edu_dashboard'].some((m) => deps.inPlan(m))
+    const edu = withEdu ? await req.app.locals.eduInvoices(req, { from, to }) : []
+    res.send([...ips, ...edu].sort((a, b) => String(b.number).localeCompare(String(a.number))))
+  }))
+
   // ---------------------------------------------------------------- Cuentas de cobro
   const pendingQuery = (req, epsId, from, to, serviceId) => {
     let q = supabase.from('service_charges').select(CHARGE_SELECT).eq('payment_mode', 'cuenta_cobro').eq('billing_status', 'pendiente').order('service_date')

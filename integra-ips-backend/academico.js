@@ -555,6 +555,45 @@ module.exports = (app, deps) => {
     await must(supabase.from('edu_enrollments').update({ ...patch, invoice_voided: voided }).eq('id', e.id))
     res.send(enrollDTO(await loadEnrollment(req, e.id)))
   }))
+  // ---------------------------------------------------------------- Libro de facturas de Educación
+  // Una fila por factura (al estudiante o al convenio), vigente o anulada, con su estado de pago. ?desde=&hasta= (fecha de emisión).
+  // También lo usa Facturación (IPS) para mostrar el consecutivo completo: app.locals.eduInvoices.
+  const eduInvoices = async (req, { from, to } = {}) => {
+    const site = scopeSite(req)
+    const rows = await must(supabase.from('edu_enrollments').select(`${ENROLL_SELECT}, group_full:edu_groups(site:sites(id, name))`).limit(5000))
+    const inRange = (d) => (!from || d >= from) && (!to || d <= to)
+    const out = []
+    for (const e of rows.filter((x) => (x.invoice_number || x.agreement_invoice_number || (x.invoice_voided || []).length) && (!site || Number(x.student?.site_id) === Number(site)))) {
+      const st = e.student ? { name: `${e.student.first_name} ${e.student.last_name}`.trim(), doc: `${e.student.doc_type} ${e.student.doc_number}` } : { name: '—', doc: '' }
+      const concept = [e.program?.name, e.period?.name, e.academic_period && `periodo ${e.academic_period}`].filter(Boolean).join(' · ')
+      const base = { origin: 'educacion', originLabel: 'Educación', enrollmentId: e.id, studentId: e.student_id, programId: e.program_id, program: e.program?.name, site: e.group_full?.site?.name || null, concept }
+      if (e.invoice_number) {
+        const a = account(e)
+        const d = String(e.invoiced_at || e.enrolled_at).slice(0, 10)
+        if (inRange(d)) out.push({ ...base, key: `e${e.id}`, kind: 'estudiante', kindLabel: 'Estudiante', number: e.invoice_number, issuedAt: d, customer: st.name, customerDoc: st.doc,
+          subtotal: Number(e.base_value), discount: Number(e.discount_value || 0) + Number(e.agreement_value || 0), iva: 0, total: Number(e.total_value), status: 'vigente',
+          payment: a.balance <= 0 ? { label: 'Pagada', tone: 'ok' } : a.overdue > 0 ? { label: `En mora · saldo ${Math.round(a.balance).toLocaleString('es-CO')}`, tone: 'bad' } : { label: `Pendiente · saldo ${Math.round(a.balance).toLocaleString('es-CO')}`, tone: 'warn' },
+          balance: Math.max(0, a.balance), href: `/educacion/facturas/${e.id}` })
+      }
+      if (e.agreement_invoice_number) {
+        const d = String(e.agreement_invoiced_at || e.enrolled_at).slice(0, 10)
+        if (inRange(d)) out.push({ ...base, key: `c${e.id}`, kind: 'convenio', kindLabel: 'Convenio', number: e.agreement_invoice_number, issuedAt: d, customer: e.agreement_name || 'Convenio', customerDoc: '',
+          concept: `Aporte del convenio · ${st.name} · ${concept}`, subtotal: Number(e.agreement_value), discount: 0, iva: 0, total: Number(e.agreement_value), status: 'vigente',
+          payment: { label: 'Por cobrar al convenio', tone: 'info' }, balance: Number(e.agreement_value), href: `/educacion/facturas/${e.id}?tipo=convenio` })
+      }
+      for (const v of e.invoice_voided || []) {
+        const d = String(v.at || '').slice(0, 10)
+        if (!inRange(d)) continue
+        out.push({ ...base, key: `v${e.id}-${v.number}`, kind: v.kind, kindLabel: v.kind === 'convenio' ? 'Convenio' : 'Estudiante', number: v.number, issuedAt: d, customer: v.kind === 'convenio' ? (e.agreement_name || 'Convenio') : st.name, customerDoc: v.kind === 'convenio' ? '' : st.doc,
+          subtotal: null, discount: null, iva: 0, total: null, status: 'anulada', voidReason: v.reason, payment: { label: 'Anulada', tone: 'bad' }, balance: 0, href: null })
+      }
+    }
+    return out.sort((a, b) => String(b.number).localeCompare(String(a.number)))
+  }
+  app.locals.eduInvoices = eduInvoices
+  app.get('/academico/facturas', auth(STAFF), hx(async (req, res) => {
+    res.send(await eduInvoices(req, { from: date(req.query.desde), to: date(req.query.hasta) }))
+  }))
   // Factura imprimible: ?tipo=estudiante (por defecto) | convenio.
   app.get('/academico/matriculas/:id/factura', auth([...STAFF, 'estudiante']), hx(async (req, res) => {
     const raw = await loadEnrollment(req, req.params.id)
