@@ -1498,7 +1498,7 @@ module.exports = (app, deps) => {
     await must(supabase.from('edu_sessions').update({ teacher_signed_at: now, teacher_signed_by: req.user.id, teacher_signature_url: url, status: 'realizada', updated_at: now }).eq('id', x.id))
     const full = await loadSession(req, x.id)
     const v = await attendanceView(req, full)
-    tg()?.notify('academico', [`<b>📝 Acta de asistencia por firmar</b>`, SEP, `🎓 ${esc(full.group?.program?.name || '')} · grupo <b>${esc(full.group?.code || '')}</b>`, full.subject?.name ? `📘 ${esc(full.subject.name)}` : null, `📅 ${esc(fmtDay(full.date))} · ${hhmm(full.start_time)}–${hhmm(full.end_time)}`, `✅ ${v.summary.presente + v.summary.tarde} asistieron · ❌ ${v.summary.ausente} ausentes · 📄 ${v.summary.excusa} con excusa`, `✍️ Firmó: ${esc(v.teacher.name || '')}`].filter(Boolean).join('\n'), full.group?.site_id)
+    tg()?.notify('academico', [`<b>📝 Acta de asistencia por firmar</b>`, SEP, `🎓 ${esc(full.group?.program?.name || '')} · grupo <b>${esc(full.group?.code || '')}</b>`, full.subject?.name ? `📘 ${esc(full.subject.name)}` : null, `📅 ${esc(fmtDay(full.date))} · ${hhmm(full.start_time)}–${hhmm(full.end_time)}`, `✅ ${v.summary.presente + v.summary.tarde} asistieron · ❌ ${v.summary.ausente} ausentes · 📄 ${v.summary.excusa} con excusa`, `✍️ Firmó: ${esc(v.teacher.name || '')}`].filter(Boolean).join('\n'), full.group?.site_id, `/educacion/clases/${full.id}/asistencia`)
     res.send(v)
   }))
   app.post('/academico/clases/:id/asistencia/firmar-director', auth([...STAFF, 'docente']), hx(async (req, res) => {
@@ -1658,7 +1658,7 @@ module.exports = (app, deps) => {
     if (error) { await removeFile(file.file_path); throw error }
     // Aviso al grupo de Telegram cuando se publica material o un taller.
     const { data: gg } = await supabase.from('edu_groups').select('telegram_chat_id').eq('id', g.id).maybeSingle()
-    if (data.published && gg?.telegram_chat_id) tg()?.toChat(gg.telegram_chat_id, [`<b>${data.kind === 'taller' ? '📝 Nuevo taller' : '📚 Nuevo material'}</b>`, SEP, `🎓 ${esc(g.program?.name || '')} · grupo <b>${esc(g.code)}</b>`, data.subject?.name ? `📘 ${esc(data.subject.name)}` : null, `📄 ${esc(data.title)}`, data.due_at ? `⏰ Entrega: ${esc(new Date(data.due_at).toLocaleString('es-CO', { timeZone: 'America/Bogota', dateStyle: 'medium', timeStyle: 'short' }))}` : null, '👉 Revísalo en tu portal de estudiante.'].filter(Boolean).join('\n'))
+    if (data.published && gg?.telegram_chat_id) tg()?.toChat(gg.telegram_chat_id, [`<b>${data.kind === 'taller' ? '📝 Nuevo taller' : '📚 Nuevo material'}</b>`, SEP, `🎓 ${esc(g.program?.name || '')} · grupo <b>${esc(g.code)}</b>`, data.subject?.name ? `📘 ${esc(data.subject.name)}` : null, `📄 ${esc(data.title)}`, data.due_at ? `⏰ Entrega: ${esc(new Date(data.due_at).toLocaleString('es-CO', { timeZone: 'America/Bogota', dateStyle: 'medium', timeStyle: 'short' }))}` : null, '👉 Revísalo en tu portal de estudiante.'].filter(Boolean).join('\n'), 'academico', '/educacion/mi-aula')
     res.status(201).send(materialDTO(data))
   }))
   const loadMaterial = async (req, id) => {
