@@ -46,14 +46,19 @@ module.exports = (app, deps) => {
   const loadSettings = async () => (await supabase.from('notification_settings').select('*').maybeSingle()).data
   const sectionsDTO = () => Object.entries(SECTIONS).map(([key, s]) => ({ key, label: s.label, hint: s.hint, module: s.module, available: inPlan(s.module) }))
 
+  // Enlace al sistema al final de cada aviso, para abrir la pantalla donde se registra o se revisa.
+  const APP_URL = (process.env.PUBLIC_APP_URL || 'https://integra-ips.vercel.app').replace(/\/$/, '')
+  const SECTION_PATH = { temperatura: '/temperatura', socorro: '/socorro/eventos', vehicular: '/socorro/vehiculos', educacion: '/socorro/educacion', ambulancias: '/traslado-asistencial', inventario: '/socorro/inventario', academico: '/educacion/horarios' }
+  const withLink = (html, path, label = 'Abrir en Integra IPS') => (!path || /<a href=/.test(html) && /Integra IPS<\/a>/.test(html) ? html : `${html}\n🔗 <a href="${APP_URL}${path}">${label}</a>`)
   // Envío (en segundo plano, en el contexto de la organización de la petición).
-  const send = async (section, build, siteId) => {
+  const send = async (section, build, siteId, path) => {
     if (!SECTIONS[section] || !featureOn() || !inPlan(SECTIONS[section].module)) return
     const st = await loadSettings()
     if (!st?.enabled || !st.bot_token) return
     // El mensaje puede ser texto o una función (async) que arma el texto con datos adicionales.
-    const html = typeof build === 'function' ? await build() : build
-    if (!html) return
+    const raw = typeof build === 'function' ? await build() : build
+    if (!raw) return
+    const html = withLink(raw, path || SECTION_PATH[section])
     let q = supabase.from('notification_channels').select('chat_id, title, site_id').eq('section', section).eq('enabled', true)
     q = siteId ? q.or(`site_id.is.null,site_id.eq.${Number(siteId)}`) : q.is('site_id', null)
     const { data: chans } = await q
@@ -64,9 +69,10 @@ module.exports = (app, deps) => {
       await supabase.from('notification_log').insert({ section, chat_id: sentTo, status, detail, site_id: siteId || null })
     }
   }
-  const notify = (section, html, siteId) => { send(section, html, siteId).catch((e) => console.error('Telegram:', e.message)) }
+  const notify = (section, html, siteId, path) => { send(section, html, siteId, path).catch((e) => console.error('Telegram:', e.message)) }
   // Envío directo a un grupo de Telegram (p. ej. el grupo de un grupo académico de Educación), con el bot de la organización.
-  const toChat = (chatId, html, section = 'academico') => {
+  const toChat = (chatId, rawHtml, section = 'academico', path = '/educacion/mi-horario') => {
+    const html = withLink(rawHtml, path, 'Abrir en Integra IPS')
     const run = async () => {
       if (!chatId || !featureOn() || (SECTIONS[section] && !inPlan(SECTIONS[section].module))) return
       const st = await loadSettings()

@@ -14,6 +14,7 @@ const GRACE_MIN = 90 // si la tarea no corrió a tiempo, no se avisan lecturas d
 const SHIFTS: Record<string, string> = { manana: 'Mañana', tarde: 'Tarde' }
 const DEFAULT_REMINDERS = { enabled: true, reminders: [{ time: '09:00', shift: 'manana' }, { time: '12:00', shift: 'manana' }, { time: '14:00', shift: 'tarde' }, { time: '18:00', shift: 'tarde' }] }
 const SEP = '━━━━━━━━━━━━━━━'
+const APP_URL = (Deno.env.get('APP_URL') || 'https://integra-ips.vercel.app').replace(/\/$/, '')
 
 const sb = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!, { auth: { persistSession: false } })
 const esc = (t: unknown) => String(t ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]!))
@@ -46,7 +47,7 @@ const message = (siteName: string, p: Reading, day: { short: string; done: boole
   `📋 ${esc(p.label)}\n` +
   `⚠️ Ya pasaron ${minutesLate} minutos de la hora de toma y la lectura <b>aún no está registrada</b>.\n` +
   `📋 Hoy: ${day.map((d) => `${d.done ? '✅' : '⬜'} ${d.short}`).join(' · ')}\n` +
-  `👉 Regístrala en Integra IPS → Temperatura.`
+  `👉 Regístrala aquí: <a href="${APP_URL}/temperatura">Integra IPS → Temperatura</a>`
 
 const tg = async (token: string, chatId: string, text: string) => {
   const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true }), signal: AbortSignal.timeout(15000) })
