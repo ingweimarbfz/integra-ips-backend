@@ -10,7 +10,7 @@ const bcrypt = require('bcryptjs')
 const tenant = require('./tenant')
 
 // Estado del plan de cada organización (en caché un minuto; se recarga cuando cambia algo en la plataforma).
-const EMPTY = { modules: null, features: null, plan: null, organization: null, loadedAt: 0 }
+const EMPTY = { modules: null, features: null, plan: null, organization: null, disabledModules: [], loadedAt: 0 }
 const states = new Map()
 const stateOf = (orgId) => (orgId && states.get(Number(orgId))) || EMPTY
 // Plan de la organización de la petición actual.
@@ -35,12 +35,14 @@ const register = (app, deps) => {
     const { data: feats } = await supabase.from('plt_features').select('key, module_key')
     // Organización inexistente: sin módulos. Sin plan asignado: sin restricción (como antes).
     if (!org) { const st = { ...EMPTY, modules: [], features: [], loadedAt: Date.now() }; states.set(orgId, st); return st }
-    if (!org.plan) { const st = { ...EMPTY, organization: { id: org.id, name: org.name, status: org.status }, loadedAt: Date.now() }; states.set(orgId, st); return st }
+    // Módulos que la propia organización decidió no usar (p. ej. Facturación): se ocultan aunque el plan los incluya.
+    const disabled = Array.isArray(org.disabled_modules) ? org.disabled_modules : []
+    if (!org.plan) { const st = { ...EMPTY, modules: disabled.length ? MODULE_KEYS.filter((m) => !disabled.includes(m)) : null, disabledModules: disabled, organization: { id: org.id, name: org.name, status: org.status }, loadedAt: Date.now() }; states.set(orgId, st); return st }
     const keys = new Set([...(org.plan.features || []), ...(org.extra_features || [])])
     const suspended = ['suspendida', 'cancelada'].includes(org.status)
     const modules = suspended ? [] : (feats || []).filter((f) => f.module_key && keys.has(f.key)).map((f) => f.module_key)
     const st = {
-      modules: [...new Set(modules)], features: suspended ? [] : [...keys], loadedAt: Date.now(),
+      modules: [...new Set(modules)].filter((m) => !disabled.includes(m)), disabledModules: disabled, features: suspended ? [] : [...keys], loadedAt: Date.now(),
       plan: { id: org.plan.id, code: org.plan.code, name: org.plan.name, audience: org.plan.audience },
       organization: { id: org.id, name: org.name, status: org.status, billingCycle: org.billing_cycle, renewalDate: org.renewal_date }
     }
@@ -48,6 +50,31 @@ const register = (app, deps) => {
     return st
   }
   loader = load
+
+  // ---------------------------------------------------------------- Módulos opcionales de la organización (IIPS-021)
+  // El administrador de la organización puede apagar módulos que no usa. Los registros de los demás módulos se crean igual:
+  // por ejemplo, sin Facturación la citología queda "por facturar" y la vacuna se registra sin factura.
+  const OPTIONAL_MODULES = { facturacion: 'Facturación, EPS y cuentas de cobro' }
+  app.get('/configuracion/modulos', deps.auth(['administrador']), hx(async (req, res) => {
+    const st = await ensure(tenant.currentOrg())
+    res.send({ options: Object.entries(OPTIONAL_MODULES).map(([key, label]) => ({ key, label, enabled: !(st.disabledModules || []).includes(key) })) })
+  }))
+  app.put('/configuracion/modulos', deps.auth(['administrador']), hx(async (req, res) => {
+    const orgId = tenant.currentOrg()
+    if (!orgId) throw httpError(400, 'Organización no identificada')
+    const want = req.body?.enabled || {}
+    const { data: org, error: e1 } = await supabase.from('plt_organizations').select('disabled_modules').eq('id', orgId).single()
+    if (e1) throw e1
+    const current = new Set(Array.isArray(org.disabled_modules) ? org.disabled_modules : [])
+    for (const key of Object.keys(OPTIONAL_MODULES)) {
+      if (!(key in want)) continue
+      if (want[key]) current.delete(key); else current.add(key)
+    }
+    const { error } = await supabase.from('plt_organizations').update({ disabled_modules: [...current], updated_at: new Date().toISOString() }).eq('id', orgId)
+    if (error) throw error
+    const st = await load(orgId)
+    res.send({ options: Object.entries(OPTIONAL_MODULES).map(([key, label]) => ({ key, label, enabled: !st.disabledModules.includes(key) })) })
+  }))
   // Tras un cambio en la plataforma se recargan todas las organizaciones en caché.
   const refresh = async () => { await Promise.all([...states.keys()].map((id) => load(id).catch(() => {}))) }
 

@@ -60,7 +60,7 @@ module.exports = (app, deps) => {
     canClose: t.status === 'abierto' && (!t.gso_events || t.gso_events.status !== 'en_curso'),
     vehicle: t.vehicles ? { id: t.vehicles.id, movil: t.vehicles.movil, plate: t.vehicles.plate, vehicleType: t.vehicles.vehicle_type, brand: t.vehicles.brand, line: t.vehicles.line } : null,
     driver: t.driver ? { id: t.driver.id, name: fullName(t.driver), identification: t.driver.identification } : null,
-    startedAt: t.started_at, endedAt: t.ended_at, kmOut: Number(t.km_out), kmIn: t.km_in == null ? null : Number(t.km_in),
+    startedAt: t.started_at, endedAt: t.ended_at, recordedAt: t.created_at, kmOut: Number(t.km_out), kmIn: t.km_in == null ? null : Number(t.km_in),
     kmDiff: t.km_diff == null ? null : Number(t.km_diff), tachometerPhoto: t.tachometer_photo,
     fuelValue: t.fuel_value == null ? null : Number(t.fuel_value), fuelGallons: t.fuel_gallons == null ? null : Number(t.fuel_gallons),
     fuelTicketPhoto: t.fuel_ticket_photo, observation: t.observation,
@@ -491,8 +491,11 @@ module.exports = (app, deps) => {
       activity = `Traslado asistencial ${ambulanceType(v.vehicle_type)}: ${transfer.patient_name} → ${transfer.destination}`
     }
     if (!activity) return fail(res, 'Selecciona una actividad o servicio, o escribe una nueva', 400)
+    const start = V.manualTime(b.startedAt, { label: 'La fecha y hora de salida' })
+    if (start.error) return fail(res, start.error, 400)
     const { data, error } = await supabase.from('vehicle_trips').insert({
-      vehicle_id: v.id, driver_id: driverId, event_id: eventId, activity, km_out: Number(v.current_km), observation: clean(b.observation), created_by: req.user.id, site_id: v.site_id
+      vehicle_id: v.id, driver_id: driverId, event_id: eventId, activity, km_out: Number(v.current_km), observation: clean(b.observation), created_by: req.user.id, site_id: v.site_id,
+      started_at: start.iso
     }).select('id').single()
     if (error) {
       if (error.code === '23505') {
@@ -534,8 +537,10 @@ module.exports = (app, deps) => {
     if (!tach) return fail(res, 'Foto del tacómetro inválida', 400)
     const ticket = fuel && b.fuelTicketImage ? await uploadImage('vehicles', `ticket-${t.code}`, b.fuelTicketImage, IMG) : null
     if (fuel && !ticket) return fail(res, 'Foto del ticket inválida', 400)
+    const end = V.manualTime(b.endedAt, { after: t.started_at, label: 'La fecha y hora de llegada' })
+    if (end.error) return fail(res, end.error, 400)
     const { error } = await supabase.from('vehicle_trips').update({
-      status: 'cerrado', ended_at: new Date().toISOString(), km_in: kmIn, tachometer_photo: tach,
+      status: 'cerrado', ended_at: end.iso, km_in: kmIn, tachometer_photo: tach,
       fuel_value: fuel || null, fuel_gallons: fuel ? gallons : null, fuel_ticket_photo: ticket,
       observation: b.observation !== undefined ? clean(b.observation) : t.observation, updated_at: new Date().toISOString()
     }).eq('id', t.id)

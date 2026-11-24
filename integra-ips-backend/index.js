@@ -157,6 +157,8 @@ const toUserDTO = (u) => ({
   site: u.site ? siteDTO(u.site) : null,
   modules: userModules(u),
   plan: platform.state.plan ? { name: platform.state.plan.name, code: platform.state.plan.code, modules: platform.state.modules } : null,
+  // Módulos permitidos (plan contratado menos los que la organización apagó); null = sin restricción.
+  planModules: platform.state.modules,
   customModules: Array.isArray(u.modules) ? u.modules : null
 })
 
@@ -1179,14 +1181,16 @@ app.post('/registrar-toma-de-muestras-citologicas', auth(STAFF), requireIps('cit
   // Sin el módulo de facturación en el plan, la citología se registra sin factura y queda "por facturar".
   row.site_id = await targetSite(req, body.siteId)
   const tariff = await getCytologyTariff()
-  if (!tariff) return fail(res, 'Configura la tarifa de la citología en Facturación → Tarifario', 400)
+  // Sin Facturación (plan u organización que la ocultó) la citología se registra aunque no haya tarifa: queda sin valor.
+  if (!tariff && inPlan('facturacion')) return fail(res, 'Configura la tarifa de la citología en Facturación → Tarifario', 400)
+  const price = tariff ? tariff.price : null
   let invoice = null
   if (inPlan('facturacion')) {
     if (!Number(body.invoiceId)) return fail(res, 'Primero factura la citología en Facturación → Servicios facturables y elige aquí la factura de la paciente', 400)
     try { invoice = await billing.takeInvoice(req, { module: 'citologia', chargeId: body.invoiceId, docNumber: row.num_documento, siteId: row.site_id }) } catch (e) { return fail(res, e.message, e.status || 400) }
   }
   let bill
-  try { bill = await billing.resolveBilling({ entityId: body.entityId, epsId: invoice ? invoice.eps_id : body.epsId }, tariff.price) } catch (e) { return fail(res, e.message, e.status || 400) }
+  try { bill = await billing.resolveBilling({ entityId: body.entityId, epsId: invoice ? invoice.eps_id : body.epsId }, price) } catch (e) { return fail(res, e.message, e.status || 400) }
   row.entity_id = bill.entity_id; row.eps_id = bill.eps_id
   if (bill.entidad) row.entidad = bill.entidad
   row.eps = bill.eps || null
@@ -1197,7 +1201,7 @@ app.post('/registrar-toma-de-muestras-citologicas', auth(STAFF), requireIps('cit
       discount_name: invoice.discount_name, discount_amount: invoice.unitDiscount || null, payment_mode: invoice.payment_mode, billing_status: invoice.billing_status, billing_id: invoice.billing_id
     })
   } else {
-    row.valor = tariff.price; row.valor_base = tariff.price; row.payment_mode = 'contado'; row.billing_status = 'por_facturar'
+    row.valor = price; row.valor_base = price; row.payment_mode = 'contado'; row.billing_status = 'por_facturar'
   }
 
   // Elaboró / tomó muestra deben ser empleados registrados de la sede.
@@ -1212,8 +1216,8 @@ app.post('/registrar-toma-de-muestras-citologicas', auth(STAFF), requireIps('cit
     try { await billing.linkInvoice(invoice.id, 'cytology_samples', data.id, data.num_lamina, { doc: row.num_documento, name: `${row.nombre || ''} ${row.apellidos || ''}`.trim() }) } catch (e) { console.error('No se pudo enlazar la factura', invoice.invoice_number, data.id, e.message) }
     return res.status(201).send({ message: 'Datos registrados exitosamente', id: data.id, numFactura: data.num_factura, numLamina: data.num_lamina, edad: data.edad })
   }
-  // Sin facturación en el plan: queda "por facturar".
-  await billing.recordCharge({
+  // Sin facturación en el plan: queda "por facturar" (si hay tarifa; sin tarifa no hay cobro que registrar).
+  if (tariff) await billing.recordCharge({
     site_id: row.site_id, service_id: tariff.serviceId, service_name: 'Citología', source_table: 'cytology_samples', source_id: data.id,
     service_date: row.fecha_examen, patient_name: `${row.nombre || ''} ${row.apellidos || ''}`.trim(), patient_doc: `${row.tipo_documento || ''} ${row.num_documento || ''}`.trim(),
     reference: data.num_lamina, eps_id: row.eps_id, entity_id: row.entity_id, valor_base: tariff.price, discount_amount: 0, valor: tariff.price,
