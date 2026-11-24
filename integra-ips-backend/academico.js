@@ -53,7 +53,7 @@ module.exports = (app, deps) => {
     })
     const totalHours = periods.reduce((a, x) => a + x.hours, 0)
     return {
-      id: p.id, code: p.code, name: p.name, kind: p.kind, kindLabel: KINDS[p.kind], certType: p.cert_type, certLabel: CERT_TYPES[p.cert_type],
+      id: p.id, code: p.code, name: p.name, kind: p.kind, kindLabel: KINDS[p.kind], certType: p.cert_type, certLabel: CERT_TYPES[p.cert_type], certificateTemplateId: p.certificate_template_id ?? null,
       modality: p.modality, billingMode: p.billing_mode, periodLabel: p.period_label,
       price: Number(p.price), totalPrice: p.billing_mode === 'total' ? Number(p.price) : periods.reduce((a, x) => a + x.price, 0),
       registrationNumber: p.registration_number, registrationDate: p.registration_date, registrationExpires: p.registration_expires,
@@ -645,7 +645,8 @@ module.exports = (app, deps) => {
       rulesTitle: edu?.rules_title || 'Reglamento estudiantil', rulesText: edu?.rules_text || null, rulesVersion: edu?.rules_version || '1.0',
       contractClauses: edu?.contract_clauses || null, refundPolicy: edu?.refund_policy || null,
       attendanceFormat: { code: edu?.attendance_format_code || null, name: edu?.attendance_format_name || 'Registro de asistencia', version: edu?.attendance_format_version || null },
-      minAttendancePct: Number(edu?.min_attendance_pct ?? 80), directorUserId: edu?.director_user_id ?? null, passingScore: Number(edu?.passing_score ?? 3)
+      minAttendancePct: Number(edu?.min_attendance_pct ?? 80), directorUserId: edu?.director_user_id ?? null, passingScore: Number(edu?.passing_score ?? 3),
+      jitsiDomain: edu?.jitsi_domain || 'meet.jit.si'
     }
   }
   app.post('/academico/matriculas/:id/pagos', auth(STAFF), hx(async (req, res) => {
@@ -828,6 +829,7 @@ module.exports = (app, deps) => {
     // Formato institucional del acta de asistencia, asistencia mínima y director de educación (firma las actas).
     if (b.attendanceFormat) Object.assign(row, { attendance_format_code: clean(b.attendanceFormat.code)?.slice(0, 30) ?? null, attendance_format_name: clean(b.attendanceFormat.name)?.slice(0, 120) || 'Registro de asistencia', attendance_format_version: clean(b.attendanceFormat.version)?.slice(0, 20) ?? null })
     if ('passingScore' in b) { const p = num(b.passingScore, 3); if (p < 0 || p > 5) return fail(res, 'La nota mínima aprobatoria debe estar entre 0 y 5', 400); row.passing_score = p }
+    if ('jitsiDomain' in b) { const d = String(b.jitsiDomain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''); if (d && !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)) return fail(res, 'Dominio de Jitsi inválido (ej. meet.jit.si)', 400); row.jitsi_domain = d || 'meet.jit.si' }
     if ('minAttendancePct' in b) { const m = num(b.minAttendancePct, 80); if (m < 0 || m > 100) return fail(res, 'La asistencia mínima debe estar entre 0 y 100 %', 400); row.min_attendance_pct = m }
     if ('directorUserId' in b) {
       const id = Number(b.directorUserId) || null
@@ -984,7 +986,8 @@ module.exports = (app, deps) => {
   // ---------------------------------------------------------------- Horarios y clases (fase 3)
   // Un horario (plantilla) genera las clases concretas entre su inicio y su fin en los días elegidos (1 = lunes … 7 = domingo).
   // Cada clase se reprograma, cambia de enlace o se cancela por separado; en la fase 4 lleva la asistencia.
-  const PLATFORMS = { meet: 'Google Meet', teams: 'Microsoft Teams', zoom: 'Zoom', otro: 'Otra plataforma' }
+  // IIPS-028: jitsi = aula virtual integrada (la sala la genera el sistema; no lleva enlace externo).
+  const PLATFORMS = { jitsi: 'Aula virtual integrada', meet: 'Google Meet', teams: 'Microsoft Teams', zoom: 'Zoom', otro: 'Otra plataforma' }
   const WEEKDAYS = ['', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
   const TIME = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/
   const hhmm = (t) => String(t || '').slice(0, 5)
@@ -1052,7 +1055,7 @@ module.exports = (app, deps) => {
     const modality = 'modality' in b ? (['presencial', 'virtual'].includes(b.modality) ? b.modality : null) : current.modality
     if (!modality) e.push('Modalidad inválida')
     const platform = modality === 'virtual' ? ('platform' in b ? (PLATFORMS[b.platform] ? b.platform : null) : current.platform) : null
-    const url = modality === 'virtual' ? ('meetingUrl' in b ? clean(b.meetingUrl) : current.meeting_url) : null
+    const url = modality === 'virtual' && platform !== 'jitsi' ? ('meetingUrl' in b ? clean(b.meetingUrl) : current.meeting_url) : null
     if (modality === 'virtual' && !platform) e.push('Elige la plataforma de la clase virtual')
     if (url && !URL_RE.test(url)) e.push('El enlace de la clase debe empezar por https://')
     const start = 'startTime' in b ? clean(b.startTime) : hhmm(current.start_time)
@@ -1933,7 +1936,66 @@ module.exports = (app, deps) => {
     if (req.user.role === 'estudiante') { const { data: st } = await supabase.from('edu_students').select('id').eq('user_id', req.user.id).maybeSingle(); if (!st || st.id !== c.student_id) throw httpError(403, 'Ese certificado no es tuyo') }
     return c
   }
-  app.get('/academico/certificados/:id', auth([...STAFF, 'estudiante']), hx(async (req, res) => res.send(certDTO(await loadCert(req, req.params.id)))))
+  // IIPS-028 · Plantillas de certificado: la del programa, o la predeterminada; sin plantilla se usa el diseño de fábrica.
+  const TPL_FIELDS = (t) => t && ({ id: t.id, name: t.name, isDefault: t.is_default, orientation: t.orientation, titleText: t.title_text, introText: t.intro_text, bodyText: t.body_text, closingText: t.closing_text, footerText: t.footer_text, primaryColor: t.primary_color, borderStyle: t.border_style, backgroundUrl: t.background_url, showLogo: t.show_logo, signers: t.signers || [], active: t.active, updatedAt: t.updated_at })
+  const templateFor = async (programId) => {
+    const p = programId ? await must(supabase.from('edu_programs').select('certificate_template_id').eq('id', programId).maybeSingle()) : null
+    if (p?.certificate_template_id) { const t = await must(supabase.from('edu_certificate_templates').select('*').eq('id', p.certificate_template_id).eq('active', true).maybeSingle()); if (t) return t }
+    return must(supabase.from('edu_certificate_templates').select('*').eq('is_default', true).eq('active', true).limit(1).maybeSingle())
+  }
+  app.get('/academico/certificados/:id', auth([...STAFF, 'estudiante']), hx(async (req, res) => {
+    const c = await loadCert(req, req.params.id)
+    const t = await templateFor(c.program_id).catch(() => null)
+    // Firmas de la plantilla que toman la firma digital de un usuario.
+    const signers = []
+    for (const sg of t?.signers || []) {
+      let sig = null
+      if (Number(sg.userId)) { const u = await must(supabase.from('users').select('signature_url, name, last_name').eq('id', Number(sg.userId)).maybeSingle()); sig = u?.signature_url || null; if (!sg.name && u) sg.name = `${u.name} ${u.last_name}`.trim() }
+      signers.push({ label: sg.label || '', name: sg.name || '', signatureUrl: sg.useIssuer ? c.signer_signature_url : sig })
+    }
+    res.send({ ...certDTO(c), template: t ? { ...TPL_FIELDS(t), signers } : null })
+  }))
+  app.get('/academico/plantillas-certificado', auth(STAFF), hx(async (req, res) => res.send((await must(supabase.from('edu_certificate_templates').select('*').order('is_default', { ascending: false }).order('name'))).map(TPL_FIELDS))))
+  const tplRow = (b) => {
+    if (!clean(b.name)) throw httpError(400, 'Escribe el nombre de la plantilla')
+    if (!clean(b.bodyText)) throw httpError(400, 'Escribe el texto del certificado')
+    if (b.primaryColor && !/^#[0-9A-Fa-f]{6}$/.test(b.primaryColor)) throw httpError(400, 'Color inválido')
+    const signers = (Array.isArray(b.signers) ? b.signers : []).slice(0, 4).map((x) => ({ label: clean(x.label)?.slice(0, 80) || '', name: clean(x.name)?.slice(0, 120) || '', userId: Number(x.userId) || null, useIssuer: Boolean(x.useIssuer) }))
+    return {
+      name: clean(b.name).slice(0, 120), orientation: b.orientation === 'portrait' ? 'portrait' : 'landscape', title_text: clean(b.titleText)?.slice(0, 160) ?? null,
+      intro_text: clean(b.introText)?.slice(0, 200) ?? 'Otorgado a', body_text: clean(b.bodyText).slice(0, 3000), closing_text: clean(b.closingText)?.slice(0, 500) ?? 'Dado en {{ciudad}}, el {{fecha}}.',
+      footer_text: clean(b.footerText)?.slice(0, 500) ?? null, primary_color: b.primaryColor || '#1F2A44', border_style: ['doble', 'simple', 'ninguno'].includes(b.borderStyle) ? b.borderStyle : 'doble',
+      show_logo: b.showLogo !== false, signers, active: b.active !== false, updated_at: new Date().toISOString()
+    }
+  }
+  const setDefault = async (id) => { await supabase.from('edu_certificate_templates').update({ is_default: false }).neq('id', id); await supabase.from('edu_certificate_templates').update({ is_default: true }).eq('id', id) }
+  app.post('/academico/plantillas-certificado', auth(ADMIN), hx(async (req, res) => {
+    const row = tplRow(req.body || {})
+    const t = await must(supabase.from('edu_certificate_templates').insert(row).select('*').single())
+    if (req.body?.isDefault) await setDefault(t.id)
+    res.status(201).send(TPL_FIELDS({ ...t, is_default: Boolean(req.body?.isDefault) }))
+  }))
+  app.put('/academico/plantillas-certificado/:id', auth(ADMIN), hx(async (req, res) => {
+    const id = Number(req.params.id)
+    const t = await must(supabase.from('edu_certificate_templates').update(tplRow(req.body || {})).eq('id', id).select('*').single())
+    if (req.body?.isDefault) await setDefault(id)
+    res.send(TPL_FIELDS({ ...t, is_default: Boolean(req.body?.isDefault) || t.is_default }))
+  }))
+  app.post('/academico/plantillas-certificado/:id/fondo', auth(ADMIN), hx(async (req, res) => {
+    const url = req.body?.image ? await deps.uploadImage('branding', `cert-fondo-${req.params.id}`, req.body.image, ['image/png', 'image/jpeg', 'image/webp']) : null
+    if (req.body?.image && !url) return fail(res, 'Imagen inválida (PNG, JPG o WEBP de máximo 2 MB)', 400)
+    const t = await must(supabase.from('edu_certificate_templates').update({ background_url: url, updated_at: new Date().toISOString() }).eq('id', Number(req.params.id)).select('*').single())
+    res.send(TPL_FIELDS(t))
+  }))
+  app.delete('/academico/plantillas-certificado/:id', auth(ADMIN), hx(async (req, res) => {
+    await must(supabase.from('edu_certificate_templates').delete().eq('id', Number(req.params.id)))
+    res.send({ ok: true })
+  }))
+  // Plantilla de cada programa.
+  app.put('/academico/programas/:id/plantilla-certificado', auth(ADMIN), hx(async (req, res) => {
+    await must(supabase.from('edu_programs').update({ certificate_template_id: Number(req.body?.templateId) || null }).eq('id', Number(req.params.id)))
+    res.send({ ok: true })
+  }))
   app.post('/academico/certificados/:id/anular', auth(ADMIN), hx(async (req, res) => {
     const c = await loadCert(req, req.params.id)
     if (c.voided) return fail(res, 'El certificado ya está anulado', 409)
@@ -2041,6 +2103,38 @@ module.exports = (app, deps) => {
   }))
 
   // IIPS-022 · Avisos del docente: clases dictadas sin cerrar la asistencia y entregas por revisar.
+  // ================================================================ IIPS-028 · Aula virtual integrada (Jitsi)
+  // La sala se genera por clase (nombre difícil de adivinar). El docente y los estudiantes matriculados entran
+  // desde el sistema; queda registro de quién ingresó. El dominio de Jitsi se configura (meet.jit.si o uno propio/JaaS).
+  const roomName = (x) => `Integra${String(x.group?.code || 'G').replace(/[^A-Za-z0-9]/g, '')}Clase${x.id}${require('crypto').createHash('sha256').update(`${x.org_id}:${x.id}:${x.created_at}`).digest('hex').slice(0, 10)}`
+  const canEnterRoom = async (req, x) => {
+    if (STAFF.includes(req.user.role) || x.teacher_user_id === req.user.id) return 'docente'
+    if (req.user.role !== 'estudiante') return null
+    const st = await must(supabase.from('edu_students').select('id').eq('user_id', req.user.id).maybeSingle())
+    if (!st) return null
+    const enr = await must(supabase.from('edu_enrollments').select('id').eq('student_id', st.id).eq('group_id', x.group_id).in('status', ['matriculado', 'aplazado']).limit(1))
+    return enr.length ? 'estudiante' : null
+  }
+  app.get('/academico/aula-virtual/:id', auth([...STAFF, 'docente', 'estudiante']), hx(async (req, res) => {
+    const x = await must(supabase.from('edu_sessions').select(SESSION_SELECT).eq('id', Number(req.params.id)).maybeSingle())
+    if (!x) return fail(res, 'Clase no encontrada', 404)
+    const as = await canEnterRoom(req, x)
+    if (!as) return fail(res, 'No perteneces a este grupo', 403)
+    if (x.modality !== 'virtual' || x.platform !== 'jitsi') return fail(res, 'Esta clase no usa el aula virtual integrada', 400)
+    if (x.status === 'cancelada') return fail(res, 'La clase fue cancelada', 400)
+    const cfg = await settingsOf()
+    const joins = as === 'docente' ? await must(supabase.from('edu_virtual_joins').select('user_id, joined_at, user:users(name, last_name, role)').eq('session_id', x.id).order('joined_at')) : []
+    const people = {}
+    for (const j of joins) { const k = j.user_id; people[k] = people[k] || { userId: k, name: `${j.user?.name || ''} ${j.user?.last_name || ''}`.trim(), role: j.user?.role, first: j.joined_at, times: 0 }; people[k].times += 1 }
+    res.send({ session: sessionDTO(x), domain: cfg.jitsiDomain, room: roomName(x), as, displayName: `${req.user.name} ${req.user.last_name}`.trim(), email: req.user.email || null, joins: Object.values(people) })
+  }))
+  app.post('/academico/aula-virtual/:id/ingreso', auth([...STAFF, 'docente', 'estudiante']), hx(async (req, res) => {
+    const x = await must(supabase.from('edu_sessions').select('id, group_id, teacher_user_id, modality, platform').eq('id', Number(req.params.id)).maybeSingle())
+    if (!x || !(await canEnterRoom(req, x))) return fail(res, 'Sin acceso', 403)
+    await must(supabase.from('edu_virtual_joins').insert({ session_id: x.id, user_id: req.user.id }))
+    res.send({ ok: true })
+  }))
+
   // IIPS-023 · Actas de asistencia que esperan la firma del director de educación.
   alerts.register({
     key: 'edu_actas', route: '/educacion/actas', roles: ['administrador', 'empleado'],
