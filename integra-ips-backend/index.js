@@ -1405,6 +1405,8 @@ app.get('/dashboard', auth(NO_DRIVER), h(async (req, res) => {
 // Módulo Gestión de Socorro y Operaciones
 const SCOPE = { scopeSite, applyScope, canAccessSite, targetSite }
 // IIPS-025 · Eventos previos (programación y cotización); socorro y vehículos los enlazan al crear el evento o el traslado.
+// IIPS-027 · Historial de servicios por persona (citologías, vacunas, traslados y cobros).
+require('./patients')(app, { supabase, auth, h, fail, clean, STAFF, userModules, ...SCOPE })
 const planned = require('./planned')(app, { supabase, auth, h, fail, clean, STAFF, todayBogota, ...SCOPE })
 require('./socorro')(app, { planned, userModules, notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, ...SCOPE })
 // Preoperacional diario de vehículos
