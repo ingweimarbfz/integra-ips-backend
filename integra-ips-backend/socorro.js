@@ -258,7 +258,7 @@ module.exports = (app, deps) => {
 
   const eventDTO = (e, user) => ({
     id: e.id, code: e.code, name: e.name, place: e.place, area: e.area, status: e.status, siteId: e.site_id, siteName: e.site?.name, municipality: e.site?.municipality,
-    startedAt: e.started_at, endedAt: e.ended_at, materialsComplete: e.materials_complete,
+    startedAt: e.started_at, endedAt: e.ended_at, recordedAt: e.created_at, materialsComplete: e.materials_complete,
     generalObservation: e.general_observation,
     coordinator: volunteerDTO(e.coordinator),
     personnel: (e.gso_event_personnel || []).sort((a, b) => a.id - b.id).map((p) => (p.volunteers
@@ -345,8 +345,12 @@ module.exports = (app, deps) => {
     if (coord.site_id !== siteId) return fail(res, 'El coordinador debe pertenecer a la misma sede del evento', 400)
     const busy = await activeEventOf(coordinatorId)
     if (busy) return fail(res, busyMessage(coord, busy), 409)
+    // Hora de inicio: la del sistema o la que se indique (el servicio pudo empezar antes de registrarlo).
+    const start = V.manualTime(b.startedAt, { label: 'La fecha y hora de inicio' })
+    if (start.error) return fail(res, start.error, 400)
     const { data, error } = await supabase.from('gso_events').insert({
-      name: clean(b.name), place: clean(b.place), area: AREAS.includes(b.area) ? b.area : 'socorro', coordinator_id: coordinatorId, created_by: req.user.id, site_id: siteId
+      name: clean(b.name), place: clean(b.place), area: AREAS.includes(b.area) ? b.area : 'socorro', coordinator_id: coordinatorId, created_by: req.user.id, site_id: siteId,
+      started_at: start.iso
     }).select('id').single()
     if (error) throw error
     const { error: pErr } = await supabase.from('gso_event_personnel').insert({ event_id: data.id, volunteer_id: coordinatorId, added_by: req.user.id, counts_hours: !(await isPaid(coord.document)) })
@@ -570,6 +574,8 @@ module.exports = (app, deps) => {
     requireManage(event, req.user); requireOpen(event)
     const b = req.body || {}
     const returns = new Map((b.returns || []).map((r) => [Number(r.id), r]))
+    const end = V.manualTime(b.endedAt, { after: event.started_at, label: 'La fecha y hora de terminación' })
+    if (end.error) return fail(res, end.error, 400)
     // Validar todo antes de mover stock.
     for (const m of event.gso_event_materials) {
       const r = returns.get(m.id)
@@ -591,7 +597,7 @@ module.exports = (app, deps) => {
       }).eq('id', m.id)
     }
     const { error } = await supabase.from('gso_events').update({
-      status: 'finalizado', ended_at: new Date().toISOString(),
+      status: 'finalizado', ended_at: end.iso,
       materials_complete: b.materialsComplete !== undefined ? Boolean(b.materialsComplete) && complete : complete,
       general_observation: b.generalObservation !== undefined ? clean(b.generalObservation) : event.general_observation,
       updated_at: new Date().toISOString()

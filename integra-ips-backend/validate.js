@@ -24,4 +24,22 @@ const nitError = (v, label = 'El NIT') => (nit(v) && !/^\d{6,10}(-\d)?$/.test(ni
 const plate = (v) => str(v).toUpperCase().replace(/[\s-]/g, '') || null
 const plateError = (v) => (plate(v) && !PLATE_RE.test(plate(v)) ? 'La placa debe tener el formato ABC123 (o ABC12D para motos)' : null)
 
-module.exports = { digits, EMAIL_RE, PHONE_RE, phone, phoneError, emailError, docNumber, docError, nit, nitError, plate, plateError }
+
+// IIPS-021 · Fecha y hora manual de realización (eventos, servicios y traslados).
+// Sin valor se usa la hora del sistema. Con valor ("YYYY-MM-DDTHH:mm", hora de Colombia, o ISO con zona) debe ser
+// pasada (5 min de tolerancia), no más de MANUAL_MAX_DAYS atrás y, si se da, posterior a "after".
+const MANUAL_MAX_DAYS = 30
+const manualTime = (value, { after, label = 'La fecha y hora' } = {}) => {
+  if (value === undefined || value === null || value === '') return { iso: new Date().toISOString(), manual: false }
+  const str = String(value).trim()
+  const withZone = /[zZ]|[+-]\d{2}:?\d{2}$/.test(str) ? str : `${str.length === 16 ? `${str}:00` : str}-05:00`
+  const d = new Date(withZone)
+  if (Number.isNaN(d.getTime())) return { error: `${label} no es válida` }
+  const now = Date.now()
+  if (d.getTime() > now + 5 * 60000) return { error: `${label} no puede ser futura` }
+  if (d.getTime() < now - MANUAL_MAX_DAYS * 86400000) return { error: `${label} no puede ser de hace más de ${MANUAL_MAX_DAYS} días` }
+  if (after && d.getTime() < new Date(after).getTime()) return { error: `${label} no puede ser anterior al inicio` }
+  return { iso: d.toISOString(), manual: true }
+}
+
+module.exports = { manualTime, MANUAL_MAX_DAYS, digits, EMAIL_RE, PHONE_RE, phone, phoneError, emailError, docNumber, docError, nit, nitError, plate, plateError }
