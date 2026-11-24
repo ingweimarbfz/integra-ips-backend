@@ -7,6 +7,8 @@
 const crypto = require('crypto')
 const V = require('./validate')
 
+const alerts = require('./alerts')
+
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite } = deps
   const STAFF = ['administrador', 'empleado']
@@ -508,4 +510,23 @@ module.exports = (app, deps) => {
       staff: rows.map((r) => ({ id: r.id, fullName: r.fullName, positionName: r.positionName, siteName: r.siteName, percent: r.compliance.percent, missing: r.compliance.missing, contract: r.contract?.status || 'sin_contrato' }))
     })
   }))
+
+  // IIPS-022 · Avisos de talento humano: contratos, certificados y requisitos.
+  alerts.register({
+    key: 'talento', module: 'talento_humano', route: '/estandares/talento-humano/personal',
+    run: async (req) => {
+      const out = []
+      for (const r of (await loadAll(scopeSite(req))).filter((x) => x.active)) {
+        const push = (kind, level, message, date) => out.push({ id: `${r.id}:${kind}:${date || ''}`, level, title: r.fullName, message, link: `/estandares/talento-humano/personal/${r.id}`, date })
+        const c = r.contract
+        if (!c) push('contrato', 'warn', 'Sin contrato registrado')
+        else if (c.status === 'vencido') push('contrato', 'bad', `Contrato vencido desde el ${c.endDate.split('-').reverse().join('/')}`, c.endDate)
+        else if (c.status === 'por_vencer') push('contrato', 'warn', `Contrato vence en ${c.daysLeft} día${c.daysLeft === 1 ? '' : 's'}`, c.endDate)
+        for (const d of r.expiredDocs) push(`doc${d.id || d.name}`, 'bad', `${d.name} vencido`, d.expiryDate)
+        for (const d of r.expiringDocs) push(`doc${d.id || d.name}`, 'warn', `${d.name} vence en ${d.daysLeft} día${d.daysLeft === 1 ? '' : 's'}`, d.expiryDate)
+        if (r.compliance.missing) push('requisitos', 'bad', `${r.compliance.missing} requisito${r.compliance.missing === 1 ? '' : 's'} obligatorio${r.compliance.missing === 1 ? '' : 's'} sin soporte`)
+      }
+      return out
+    }
+  })
 }

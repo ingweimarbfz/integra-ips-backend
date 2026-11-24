@@ -1420,4 +1420,34 @@ require('./search')(app, { supabase, auth, h, fail, clean, userModules, ...SCOPE
 require('./signatures')(app, { supabase, auth, h, fail, clean, ADMIN, uploadImage, removeStoredFile, canAccessSite })
 require('./vehicles')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 
+// IIPS-022 · Centro de notificaciones: burbujas por ítem del menú, campana y toasts (ver alerts.js).
+const alerts = require('./alerts')
+alerts.register({
+  key: 'temperatura', module: 'temperatura', service: 'cadena_frio', roles: ['administrador', 'empleado'], route: '/temperatura',
+  run: async (req) => {
+    const svc = await coldService()
+    if (!svc) return []
+    const cfg = reminderConfig(svc)
+    const today = todayBogota(); const now = nowHHMM()
+    const scoped = scopeSite(req)
+    const siteIds = scoped ? [scoped] : ((await supabase.from('site_services').select('site_id').eq('service_id', svc.id)).data || []).map((x) => x.site_id)
+    if (!siteIds.length) return []
+    const [{ data: sites }, { data: temps }] = await Promise.all([
+      supabase.from('sites').select('id, name').in('id', siteIds),
+      supabase.from('temperature').select('site_id, shift, slot').eq('record_date', today).in('site_id', siteIds)
+    ])
+    // Lecturas cuya hora ya pasó y no se han registrado hoy.
+    const due = readingPlan(cfg).filter((p) => p.time <= now)
+    const out = []
+    for (const x of sites || []) {
+      for (const p of due) {
+        if (temps.some((t) => t.site_id === x.id && t.shift === p.shift && (t.slot || 1) === p.slot)) continue
+        out.push({ id: `${today}:${x.id}:${p.shift}${p.slot}`, level: 'warn', title: `Temperatura · ${x.name}`, message: `Falta la ${p.slot}.ª lectura de la ${SHIFTS[p.shift].toLowerCase()} (${p.time})`, date: today })
+      }
+    }
+    return out
+  }
+})
+alerts.install(app, { auth, h, userModules, inPlan: (m) => inPlan(m), siteServices, scopeSite })
+
 app.listen(PORT, () => console.log(`API escuchando en http://localhost:${PORT}`))

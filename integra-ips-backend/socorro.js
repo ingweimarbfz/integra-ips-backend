@@ -6,6 +6,8 @@
 const { pageQuery, setTotal } = require('./paging')
 const V = require('./validate')
 const tenant = require('./tenant')
+const alerts = require('./alerts')
+
 module.exports = (app, deps) => {
   const { userModules } = deps
   const { supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, scopeSite, applyScope, canAccessSite, targetSite } = deps
@@ -848,4 +850,19 @@ module.exports = (app, deps) => {
       }))
     })
   }))
+
+  // IIPS-022 · Avisos de eventos en curso (y los que llevan más de 24 h sin finalizar).
+  for (const [area, route, module] of [['socorro', '/socorro/eventos', 'socorro'], ['educacion', '/socorro/educacion', 'educacion']]) {
+    alerts.register({
+      key: `eventos_${area}`, module, route,
+      run: async (req) => {
+        const { data, error } = await applyScope(supabase.from('gso_events').select('id, code, name, place, started_at').eq('status', 'en_curso').eq('area', area), scopeSite(req)).order('started_at')
+        if (error) throw error
+        return data.map((e) => {
+          const hours = (Date.now() - new Date(e.started_at).getTime()) / 3600000
+          return { id: `${e.id}:${hours > 24 ? 'largo' : 'curso'}`, level: hours > 24 ? 'warn' : 'info', title: `${e.code} · ${e.name}`, message: hours > 24 ? `Sigue en curso desde hace ${Math.floor(hours / 24)} día(s): finalízalo si ya terminó` : `En curso en ${e.place}`, link: `${route}/${e.id}` }
+        })
+      }
+    })
+  }
 }

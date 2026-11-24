@@ -25,6 +25,8 @@ const ACTIVE_ENROLL = ['preinscrito', 'matriculado', 'aplazado']
 const DOC_TYPES = ['CC', 'TI', 'CE', 'PPT', 'PA', 'RC']
 const EXPIRY_WARN_DAYS = 180
 
+const alerts = require('./alerts')
+
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, uploadImage, notifier } = deps
   const STAFF = ['administrador', 'empleado']
@@ -2036,6 +2038,27 @@ module.exports = (app, deps) => {
       enrollments: enr.map((e) => ({ ...enrollDTO(e), pensum: programs[e.program_id] ? { totalHours: programs[e.program_id].totalHours, certLabel: programs[e.program_id].certLabel, periods: programs[e.program_id].periods.map(({ price, ...p }) => p) } : null }))
     })
   }))
+
+  // IIPS-022 · Avisos del docente: clases dictadas sin cerrar la asistencia y entregas por revisar.
+  alerts.register({
+    key: 'docente_clases', module: 'edu_docente', roles: ['docente'], route: '/educacion/docente',
+    run: async (req) => {
+      const rows = await must(supabase.from('edu_sessions').select('id, date, start_time, group:edu_groups(code), subject:edu_subjects(name)').eq('teacher_user_id', req.user.id).lte('date', todayBogota()).neq('status', 'cancelada').is('teacher_signed_at', null).order('date').limit(30))
+      return rows.map((x) => ({ id: x.id, level: 'warn', title: `${x.subject?.name || 'Clase'} · ${x.group?.code || ''}`, message: `Asistencia sin cerrar (${x.date.split('-').reverse().join('/')})`, link: `/educacion/clases/${x.id}/asistencia`, date: x.date }))
+    }
+  })
+  alerts.register({
+    key: 'docente_entregas', module: 'edu_docente', roles: ['docente'], route: '/educacion/docente/entregas',
+    run: async (req) => {
+      const ses = await must(supabase.from('edu_sessions').select('group_id').eq('teacher_user_id', req.user.id))
+      const groupIds = [...new Set(ses.map((x) => x.group_id))]
+      if (!groupIds.length) return []
+      const mats = await must(supabase.from('edu_materials').select('id, title').in('group_id', groupIds).eq('kind', 'taller').eq('published', true))
+      if (!mats.length) return []
+      const subs = await must(supabase.from('edu_submissions').select('id, material_id').in('material_id', mats.map((m) => m.id)).eq('status', 'entregado'))
+      return subs.map((x) => ({ id: x.id, level: 'info', title: mats.find((m) => m.id === x.material_id)?.title || 'Taller', message: 'Entrega por revisar' }))
+    }
+  })
 }
 
 module.exports.TABLES = ['edu_programs', 'edu_program_periods', 'edu_subjects', 'edu_groups', 'edu_students', 'edu_enrollments', 'edu_settings', 'edu_discounts', 'edu_agreements', 'edu_installments', 'edu_payments', 'edu_payment_plans', 'edu_schedules', 'edu_sessions', 'edu_attendance', 'edu_classrooms', 'edu_materials', 'edu_submissions', 'edu_grade_items', 'edu_grades', 'edu_certificates']
