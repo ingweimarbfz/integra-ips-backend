@@ -2107,6 +2107,23 @@ module.exports = (app, deps) => {
   // La sala se genera por clase (nombre difícil de adivinar). El docente y los estudiantes matriculados entran
   // desde el sistema; queda registro de quién ingresó. El dominio de Jitsi se configura (meet.jit.si o uno propio/JaaS).
   const roomName = (x) => `Integra${String(x.group?.code || 'G').replace(/[^A-Za-z0-9]/g, '')}Clase${x.id}${require('crypto').createHash('sha256').update(`${x.org_id}:${x.id}:${x.created_at}`).digest('hex').slice(0, 10)}`
+  // JaaS (8x8 Jitsi as a Service, plan Dev gratuito: 25 usuarios activos al mes): con las variables JAAS_APP_ID,
+  // JAAS_KID y JAAS_PRIVATE_KEY el sistema firma un token por persona; el docente entra como moderador y la
+  // llamada embebida no se corta a los 5 minutos. Sin ellas se usa el dominio configurado (meet.jit.si).
+  const jaasConfigured = () => Boolean(process.env.JAAS_APP_ID && process.env.JAAS_KID && process.env.JAAS_PRIVATE_KEY)
+  const jaasToken = (req, moderator, room) => {
+    if (!jaasConfigured()) return null
+    const jwt = require('jsonwebtoken')
+    const appId = process.env.JAAS_APP_ID.trim()
+    const key = process.env.JAAS_PRIVATE_KEY.replace(/\\n/g, '\n')
+    const now = Math.floor(Date.now() / 1000)
+    const token = jwt.sign({
+      aud: 'jitsi', iss: 'chat', sub: appId, room, nbf: now - 10, exp: now + 4 * 3600,
+      context: { user: { id: String(req.user.id), name: `${req.user.name} ${req.user.last_name}`.trim(), email: req.user.email || '', avatar: req.user.avatar_url || '', moderator: moderator ? 'true' : 'false' }, features: { livestreaming: 'false', recording: 'false', transcription: 'false', 'outbound-call': 'false' } }
+    }, key, { algorithm: 'RS256', header: { kid: process.env.JAAS_KID.trim(), typ: 'JWT' } })
+    return { appId, jwt: token }
+  }
+  app.get('/academico/aula-virtual-estado', auth(STAFF), hx(async (req, res) => res.send({ jaas: jaasConfigured(), domain: (await settingsOf()).jitsiDomain })))
   const canEnterRoom = async (req, x) => {
     if (STAFF.includes(req.user.role) || x.teacher_user_id === req.user.id) return 'docente'
     if (req.user.role !== 'estudiante') return null
@@ -2123,10 +2140,11 @@ module.exports = (app, deps) => {
     if (x.modality !== 'virtual' || x.platform !== 'jitsi') return fail(res, 'Esta clase no usa el aula virtual integrada', 400)
     if (x.status === 'cancelada') return fail(res, 'La clase fue cancelada', 400)
     const cfg = await settingsOf()
+    const jaas = jaasToken(req, as === 'docente', roomName(x))
     const joins = as === 'docente' ? await must(supabase.from('edu_virtual_joins').select('user_id, joined_at, user:users(name, last_name, role)').eq('session_id', x.id).order('joined_at')) : []
     const people = {}
     for (const j of joins) { const k = j.user_id; people[k] = people[k] || { userId: k, name: `${j.user?.name || ''} ${j.user?.last_name || ''}`.trim(), role: j.user?.role, first: j.joined_at, times: 0 }; people[k].times += 1 }
-    res.send({ session: sessionDTO(x), domain: cfg.jitsiDomain, room: roomName(x), as, displayName: `${req.user.name} ${req.user.last_name}`.trim(), email: req.user.email || null, joins: Object.values(people) })
+    res.send({ session: sessionDTO(x), domain: jaas ? '8x8.vc' : cfg.jitsiDomain, room: jaas ? `${jaas.appId}/${roomName(x)}` : roomName(x), jwt: jaas?.jwt || null, provider: jaas ? 'jaas' : 'jitsi', as, displayName: `${req.user.name} ${req.user.last_name}`.trim(), email: req.user.email || null, joins: Object.values(people) })
   }))
   app.post('/academico/aula-virtual/:id/ingreso', auth([...STAFF, 'docente', 'estudiante']), hx(async (req, res) => {
     const x = await must(supabase.from('edu_sessions').select('id, group_id, teacher_user_id, modality, platform').eq('id', Number(req.params.id)).maybeSingle())
