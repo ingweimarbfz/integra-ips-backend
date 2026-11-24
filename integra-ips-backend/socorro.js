@@ -363,6 +363,7 @@ module.exports = (app, deps) => {
       if (isBusyError(pErr)) return fail(res, `${coord.first_name} ${coord.last_name} ya está en otro evento en curso.`, 409)
       throw pErr
     }
+    if (b.plannedId && deps.planned) await deps.planned.linkTo(b.plannedId, { eventId: data.id })
     const created = eventDTO(await loadEvent(data.id), req.user)
     res.status(201).send(created)
     deps.notify?.(created.area === 'educacion' ? 'educacion' : 'socorro', deps.notifyMsg().evento(created, 'abierto'), created.siteId)

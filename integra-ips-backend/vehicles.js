@@ -60,6 +60,7 @@ module.exports = (app, deps) => {
     id: t.id, code: t.code, status: t.status, activity: t.activity,
     event: t.gso_events ? { id: t.gso_events.id, code: t.gso_events.code, name: t.gso_events.name, status: t.gso_events.status } : null,
     canClose: t.status === 'abierto' && (!t.gso_events || t.gso_events.status !== 'en_curso'),
+    crew: (t.vehicle_trip_crew || []).map((c) => ({ id: c.id, role: c.role, roleLabel: c.role === 'medico' ? 'Médico' : 'Auxiliar de traslado', userId: c.user?.id, name: c.user ? `${c.user.name} ${c.user.last_name}`.trim() : null, identification: c.user?.identification })),
     // IIPS-024: insumos gastados de la dotación de la ambulancia.
     supplies: (t.vehicle_trip_supplies || []).sort((a, b) => a.id - b.id).map((x) => ({ id: x.id, quantity: Number(x.quantity), observation: x.observation, createdAt: x.created_at, item: x.item ? { id: x.item.id, code: x.item.code, name: x.item.name, unit: x.item.unit, lot: x.item.lot, expiryDate: x.item.expiry_date, warehouseName: x.item.warehouse?.name ?? null } : null })),
     vehicle: t.vehicles ? { id: t.vehicles.id, movil: t.vehicles.movil, plate: t.vehicles.plate, vehicleType: t.vehicles.vehicle_type, brand: t.vehicles.brand, line: t.vehicles.line } : null,
@@ -98,7 +99,7 @@ module.exports = (app, deps) => {
     companion_name: clean(x.companionName), companion_phone: V.phone(x.companionPhone), authorization_number: clean(x.authorizationNumber),
     receiving_professional: clean(x.receivingProfessional), notes: clean(x.notes)
   })
-  const TRIP_SELECT = '*, vehicle_transfers(*), vehicles(id, movil, plate, vehicle_type, brand, line), driver:users!vehicle_trips_driver_id_fkey(id, name, last_name, identification), gso_events(id, code, name, status), vehicle_trip_supplies(id, quantity, observation, created_at, item:inventory_items(id, code, name, unit, lot, expiry_date, warehouse:warehouses(name)))'
+  const TRIP_SELECT = '*, vehicle_transfers(*), vehicles(id, movil, plate, vehicle_type, brand, line), driver:users!vehicle_trips_driver_id_fkey(id, name, last_name, identification), gso_events(id, code, name, status), vehicle_trip_supplies(id, quantity, observation, created_at, item:inventory_items(id, code, name, unit, lot, expiry_date, warehouse:warehouses(name))), vehicle_trip_crew(id, role, user:users(id, name, last_name, identification))'
 
   // Alertas de un vehículo: SOAT/documentos por vencer y mantenimiento preventivo próximo (fecha o km).
   const alertsFor = (v, docs, maints) => {
@@ -463,12 +464,18 @@ module.exports = (app, deps) => {
 
   // Abrir reporte: km de salida = km actual del vehículo; hora de salida automática.
   // Solo el conductor abre reportes diarios (el administrador los consulta).
-  app.post('/vehiculos-reportes', auth(['conductor']), hx(async (req, res) => {
+  // IIPS-025: el administrador también puede abrir el reporte o traslado indicando el conductor.
+  app.post('/vehiculos-reportes', auth(['conductor', 'administrador']), hx(async (req, res) => {
     const b = req.body || {}
     const { data: v } = await supabase.from('vehicles').select('*').eq('id', Number(b.vehicleId)).maybeSingle()
     if (!v) return fail(res, 'Busca el vehículo por su número de móvil', 400)
     if (v.status === 'fuera_servicio') return fail(res, 'El vehículo está fuera de servicio', 400)
-    const driverId = req.user.id
+    let driverId = req.user.id
+    if (req.user.role === 'administrador') {
+      const { data: d } = await supabase.from('users').select('id, role, active').eq('id', Number(b.driverId)).maybeSingle()
+      if (!d || !d.active || d.role !== 'conductor') return fail(res, 'Selecciona el conductor que lleva la móvil', 400)
+      driverId = d.id
+    }
     const blockers = await tripBlockers(v.id)
     if (blockers.length) return fail(res, `No se puede registrar el servicio con la Móvil ${v.movil}: ${blockers.join('. ')}.`, 409)
     // Un conductor solo puede tener una actividad abierta (un vehículo a la vez).
@@ -494,6 +501,23 @@ module.exports = (app, deps) => {
       transfer = transferRow(b.transfer)
       activity = `Traslado asistencial ${ambulanceType(v.vehicle_type)}: ${transfer.patient_name} → ${transfer.destination}`
     }
+    // IIPS-025 · Tripulación: TAB lleva auxiliar de traslado; TAM, auxiliar y médico. Deben ser usuarios registrados.
+    const crew = []
+    for (const c of Array.isArray(b.crew) ? b.crew : []) {
+      if (!['auxiliar', 'medico'].includes(c.role) || !Number(c.userId)) continue
+      if (crew.some((x) => x.userId === Number(c.userId))) return fail(res, 'Una persona no puede ir dos veces en la tripulación', 400)
+      crew.push({ userId: Number(c.userId), role: c.role })
+    }
+    if (crew.some((c) => c.userId === driverId)) return fail(res, 'El conductor no puede ser también parte de la tripulación', 400)
+    if (crew.length) {
+      const { data: us } = await supabase.from('users').select('id, active').in('id', crew.map((c) => c.userId))
+      if ((us || []).filter((u) => u.active).length !== crew.length) return fail(res, 'La tripulación debe estar registrada como usuarios activos', 400)
+    }
+    if (transfer) {
+      const t = ambulanceType(v.vehicle_type)
+      if (!crew.some((c) => c.role === 'auxiliar')) return fail(res, `Un traslado ${t} requiere auxiliar de traslado`, 400)
+      if (t === 'TAM' && !crew.some((c) => c.role === 'medico')) return fail(res, 'Un traslado TAM requiere también médico', 400)
+    }
     if (!activity) return fail(res, 'Selecciona una actividad o servicio, o escribe una nueva', 400)
     const start = V.manualTime(b.startedAt, { label: 'La fecha y hora de salida' })
     if (start.error) return fail(res, start.error, 400)
@@ -511,8 +535,22 @@ module.exports = (app, deps) => {
       const { error: tErr } = await supabase.from('vehicle_transfers').insert({ ...transfer, trip_id: data.id })
       if (tErr) { await supabase.from('vehicle_trips').delete().eq('id', data.id); throw tErr }
     }
+    if (crew.length) {
+      const { error: cErr } = await supabase.from('vehicle_trip_crew').insert(crew.map((c) => ({ trip_id: data.id, user_id: c.userId, role: c.role })))
+      if (cErr) { await supabase.from('vehicle_trips').delete().eq('id', data.id); throw cErr }
+    }
+    // El auxiliar o el médico que va en un servicio también queda en el personal de la actividad.
+    const warnings = []
+    if (eventId && crew.length) {
+      const { data: already } = await supabase.from('gso_event_personnel').select('user_id').eq('event_id', eventId)
+      for (const c of crew.filter((x) => !(already || []).some((a) => a.user_id === x.userId))) {
+        const { error: pErr } = await supabase.from('gso_event_personnel').insert({ event_id: eventId, user_id: c.userId, added_by: req.user.id, counts_hours: false, role_label: c.role === 'medico' ? 'Médico' : 'Auxiliar de traslado' })
+        if (pErr) warnings.push('Una persona de la tripulación no se pudo agregar al personal del servicio (puede estar en otro evento en curso).')
+      }
+    }
+    if (b.plannedId && deps.planned) await deps.planned.linkTo(b.plannedId, { tripId: data.id, eventId })
     const trip = tripDTO(await loadTrip(data.id))
-    res.status(201).send(trip)
+    res.status(201).send({ ...trip, warning: warnings[0] || null })
     if (trip.transfer) deps.notify?.('ambulancias', deps.notifyMsg().traslado(trip, 'iniciado'), v.site_id)
     else deps.notify?.('vehicular', async () => deps.notifyMsg().viaje(trip, 'iniciada', await deps.notifier().eventPeople(trip.event?.id)), v.site_id)
   }))
@@ -786,5 +824,19 @@ module.exports = (app, deps) => {
     if (error) throw error
     await supabase.from('vehicle_trip_supplies').delete().eq('id', row.id)
     res.send(tripDTO(await loadTrip(t.id)))
+  }))
+
+  // IIPS-025 · Buscar usuarios registrados para la tripulación (auxiliar de traslado, médico) y conductores (administrador).
+  app.get('/vehiculos/tripulacion/buscar', auth(TRIP_ROLES), hx(async (req, res) => {
+    const q = clean(req.query.q)?.replace(/[%_,()]/g, '')
+    if (!q || q.length < 3) return res.send([])
+    let query = supabase.from('users').select('id, name, last_name, identification, role, site:sites(name)').eq('active', true)
+      .or(`identification.ilike.%${q}%,name.ilike.%${q}%,last_name.ilike.%${q}%`).order('name').limit(15)
+    if (req.query.rol === 'conductor') query = query.eq('role', 'conductor')
+    else query = query.not('role', 'in', '(estudiante)')
+    const { data, error } = await query
+    if (error) throw error
+    const ROLES = { administrador: 'Administrador', empleado: 'Empleado', voluntario: 'Voluntario', conductor: 'Conductor', docente: 'Docente' }
+    res.send(data.map((u) => ({ id: u.id, fullName: `${u.name} ${u.last_name}`.trim(), identification: u.identification, roleLabel: ROLES[u.role] || u.role, siteName: u.site?.name ?? null })))
   }))
 }
