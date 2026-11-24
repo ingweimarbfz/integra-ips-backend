@@ -17,7 +17,7 @@ const LEGAL_ALLOW = ['/auth/me', '/legal', '/firma', '/configuracion', '/plan', 
 // Cualquier otra ruta se le niega aunque el endpoint esté abierto a todos los roles (auth() sin roles).
 const STUDENT_ALLOW = ['/auth/me', '/alertas', '/mi-direccion', '/academico/aula-virtual', '/mis-notificaciones', '/legal', '/firma', '/configuracion', '/perfil', '/academico/mi-programa', '/academico/catalogos', '/academico/mi-asistencia', '/academico/mis-clases', '/academico/mi-aula', '/academico/mis-certificados']
 // Docente (Académico ETDH): su panel, sus clases y lo básico de la cuenta.
-const TEACHER_ALLOW = ['/auth/me', '/alertas', '/mi-direccion', '/mi-hoja-de-vida', '/academico/aula-virtual', '/mis-notificaciones', '/legal', '/firma', '/configuracion', '/perfil', '/academico/docente', '/academico/catalogos', '/academico/mis-clases']
+const TEACHER_ALLOW = ['/auth/me', '/alertas', '/correspondencia', '/mi-direccion', '/mi-hoja-de-vida', '/academico/aula-virtual', '/mis-notificaciones', '/legal', '/firma', '/configuracion', '/perfil', '/academico/docente', '/academico/catalogos', '/academico/mis-clases']
 const TEACHER_ALLOW_RE = [/^\/academico\/grupos\/\d+\/(aula|notas|evaluaciones|materiales)$/, /^\/academico\/materiales\/\d+(\/entregas)?$/, /^\/academico\/entregas\/\d+\/calificar$/, /^\/academico\/evaluaciones\/\d+$/, /^\/academico\/clases\/\d+$/, /^\/academico\/clases\/\d+\/asistencia(\/[a-z0-9-]+){0,2}$/, /^\/academico\/grupos\/\d+\/asistencia$/]
 // Rutas exactas del portal: su contrato (ver y firmar), sus recibos y el reglamento. Cada endpoint valida que la matrícula sea suya.
 const STUDENT_ALLOW_RE = [/^\/academico\/certificados\/\d+$/, /^\/academico\/materiales\/\d+\/entregar$/, /^\/academico\/matriculas\/\d+\/contrato(\/firmar)?$/, /^\/academico\/matriculas\/\d+\/factura$/, /^\/academico\/pagos\/\d+$/, /^\/academico\/configuracion$/]
@@ -79,9 +79,9 @@ const IPS_MODULES = ['cadena_frio', 'citologia', 'ambulancias'] // módulos del 
 // Módulos por usuario: el administrador puede mostrar u ocultar módulos a cada usuario.
 // users.modules = null usa los del rol; un arreglo los reemplaza. El administrador ve todo.
 // ======================================================================
-const MODULE_KEYS = ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano', 'th_general', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes', 'edu_portal', 'edu_docente']
+const MODULE_KEYS = ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano', 'th_general', 'correspondencia', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes', 'edu_portal', 'edu_docente']
 const ROLE_MODULES = {
-  empleado: ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano', 'th_general', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes'],
+  empleado: ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano', 'th_general', 'correspondencia', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes'],
   voluntario: ['socorro', 'educacion', 'voluntario'],
   conductor: ['flota', 'traslado'],
   estudiante: ['edu_portal'], // Académico ETDH: portal del estudiante
@@ -91,7 +91,9 @@ const ROLE_MODULES = {
 // El plan contratado (plataforma) limita los módulos de todos, incluido el administrador.
 // IIPS-026: el talento humano de otras dependencias viene con el de IPS en el plan.
 const PLAN_ALIAS = { th_general: 'talento_humano' }
-const inPlan = (m) => !platform.state.modules || platform.state.modules.includes(m) || (PLAN_ALIAS[m] && platform.state.modules.includes(PLAN_ALIAS[m]))
+// IIPS-030: la gestión documental no depende del plan.
+const PLAN_FREE = ['correspondencia']
+const inPlan = (m) => !platform.state.modules || PLAN_FREE.includes(m) || platform.state.modules.includes(m) || (PLAN_ALIAS[m] && platform.state.modules.includes(PLAN_ALIAS[m]))
 // Funciones del plan que no son módulos del menú (p. ej. envío de documentos, recordatorios automáticos).
 const hasFeature = (k) => !platform.state.features || platform.state.features.includes(k)
 const userModules = (u) => (u.role === 'administrador' ? MODULE_KEYS : Array.isArray(u.modules) ? u.modules.filter((m) => MODULE_KEYS.includes(m)) : ROLE_MODULES[u.role] || []).filter(inPlan)
@@ -1406,6 +1408,7 @@ app.get('/dashboard', auth(NO_DRIVER), h(async (req, res) => {
 const SCOPE = { scopeSite, applyScope, canAccessSite, targetSite }
 // IIPS-025 · Eventos previos (programación y cotización); socorro y vehículos los enlazan al crear el evento o el traslado.
 // IIPS-027 · Historial de servicios por persona (citologías, vacunas, traslados y cobros).
+require('./corr')(app, { supabase, auth, h, fail, clean, ADMIN, todayBogota, uploadImage, ...SCOPE })
 require('./patients')(app, { supabase, auth, h, fail, clean, STAFF, userModules, ...SCOPE })
 const planned = require('./planned')(app, { supabase, auth, h, fail, clean, STAFF, todayBogota, ...SCOPE })
 require('./socorro')(app, { planned, userModules, notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, ...SCOPE })
