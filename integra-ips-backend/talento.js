@@ -24,6 +24,10 @@ module.exports = (app, deps) => {
   ]
   const CONTRACT_TYPES = Object.assign({}, ...CONTRACT_GROUPS.map(([, t]) => t))
   const OPEN_ENDED = ['indefinido', 'voluntariado', 'convenio', 'otro']
+  // IIPS-026 · Vacaciones (CST art. 186): 15 días hábiles por año de servicio, solo en vinculación laboral directa.
+  // OPS, contratos por evento, tercerizados (los paga su empleador), prácticas y voluntariado no generan vacaciones aquí.
+  const VACATION_CONTRACTS = ['indefinido', 'termino_fijo', 'obra_labor', 'tiempo_parcial', 'medio_tiempo', 'tiempo_completo']
+  const scopeOf = (req) => (['ips', 'general', 'todos'].includes(req.query.ambito) ? req.query.ambito : 'ips')
   const STAFF_STATUS = { activo: 'Activo', inactivo: 'Inactivo', por_eventos: 'Por eventos' }
   const EDUCATION_LEVELS = ['Ninguno', 'Básica primaria', 'Básica secundaria', 'Media académica', 'Curso corto / capacitación', 'Auxiliar', 'Técnico laboral', 'Técnico profesional', 'Tecnólogo', 'Profesional universitario', 'Especialización', 'Maestría', 'Doctorado']
   const PROFESSIONS = ['Administrador(a) de servicios de salud', 'Auxiliar administrativo en salud', 'Auxiliar de enfermería', 'Auxiliar de farmacia', 'Auxiliar de laboratorio clínico', 'Bacteriólogo(a)', 'Enfermero(a) profesional', 'Epidemiólogo(a)', 'Estudiante en práctica', 'Fisioterapeuta', 'Fonoaudiólogo(a)', 'Ingeniero(a) biomédico(a)', 'Instrumentador(a) quirúrgico(a)', 'Médico(a) especialista', 'Médico(a) general', 'Nutricionista – dietista', 'Odontólogo(a)', 'Optómetra', 'Psicólogo(a)', 'Químico farmacéutico', 'Técnico en atención prehospitalaria (APH)', 'Técnico en salud oral', 'Tecnólogo en laboratorio clínico', 'Tecnólogo en radiología e imágenes diagnósticas', 'Tecnólogo en regencia de farmacia', 'Terapeuta ocupacional', 'Terapeuta respiratorio', 'Trabajador(a) social', 'Microbiólogo(a)', 'Auxiliar contable', 'Contador(a)', 'Conductor', 'Servicios generales']
@@ -80,11 +84,12 @@ module.exports = (app, deps) => {
     return data.map((p) => ({ id: p.id, name: p.name, description: p.description, active: p.active, requirements: (p.th_position_requirements || []).map((r) => ({ requirementTypeId: r.requirement_type_id, mandatory: r.mandatory })) }))
   }
   app.get('/estandares/th/catalogos', auth(STAFF), hx(async (req, res) => {
-    const [reqs, positions, formats, svc] = await Promise.all([loadReqs(), loadPositions(), loadFormats(), supabase.from('ips_services').select('name').order('name')])
+    const [reqs, positions, formats, svc, deps2] = await Promise.all([loadReqs(), loadPositions(), loadFormats(), supabase.from('ips_services').select('name').order('name'), supabase.from('th_dependencies').select('id, name, active, sort_order').order('sort_order').order('name')])
     const services = [...new Set([...SERVICES, ...(svc.data || []).map((x) => x.name.toUpperCase())])]
     res.send({
       categories: CATEGORIES, contractTypes: CONTRACT_TYPES, contractGroups: CONTRACT_GROUPS, documentTypes: DOC_TYPES, warnDays: WARN_DAYS, staffStatus: STAFF_STATUS,
-      educationLevels: EDUCATION_LEVELS, professions: PROFESSIONS, services, formats, requirements: reqs.map(reqDTO), positions
+      educationLevels: EDUCATION_LEVELS, professions: PROFESSIONS, services, formats, requirements: reqs.map(reqDTO), positions,
+      dependencies: (deps2.data || []).map((d) => ({ id: d.id, name: d.name, active: d.active })), vacationContracts: VACATION_CONTRACTS
     })
   }))
   // Encabezado de los formatos (proceso, código, versión y fecha) que la IPS define para sus documentos.
@@ -203,15 +208,21 @@ module.exports = (app, deps) => {
     emergencyContact: s.emergency_contact, emergencyPhone: s.emergency_phone, photoUrl: s.photo_url, ipsServiceId: s.ips_service_id, ipsServiceName: s.service?.name ?? null,
     specialty: s.specialty, assignedService: s.assigned_service, hireDate: s.hire_date, status: s.status, statusLabel: STAFF_STATUS[s.status],
     educationLevel: s.education_level, degreeTitle: s.degree_title, institution: s.institution, graduationYear: s.graduation_year, rethusVerifiedAt: s.rethus_verified_at,
-    notes: s.notes, active: s.active
+    notes: s.notes, active: s.active,
+    // IIPS-026: null = personal de IPS; con dependencia = personal administrativo u otras áreas.
+    dependencyId: s.dependency_id ?? null, dependencyName: s.dependency?.name ?? null, scope: s.dependency_id ? 'general' : 'ips'
   })
   // Soportes vigentes: de cada requisito solo cuenta el más reciente (los renovados no generan alerta).
   const currentDocs = (ds) => ds.filter((d) => !d.requirement_type_id || latestDoc(ds, d.requirement_type_id)?.id === d.id)
-  const STAFF_SELECT = '*, site:sites(name), position:th_positions(name), service:ips_services(name)'
+  const STAFF_SELECT = '*, site:sites(name), position:th_positions(name), service:ips_services(name), dependency:th_dependencies(id, name)'
 
-  const loadAll = async (site) => {
+  // scope: 'ips' (sin dependencia), 'general' (con dependencia) o 'todos'; dependency: una dependencia.
+  const loadAll = async (site, scope = 'todos', dependency = null) => {
     let q = supabase.from('th_staff').select(STAFF_SELECT).order('first_name')
     if (site) q = q.eq('site_id', site)
+    if (scope === 'ips') q = q.is('dependency_id', null)
+    if (scope === 'general') q = q.not('dependency_id', 'is', null)
+    if (dependency) q = q.eq('dependency_id', dependency)
     const [staff, positions, reqs, docs, contracts, checks] = await Promise.all([
       q, loadPositions(), supabase.from('th_requirement_types').select('*').order('sort_order'),
       supabase.from('th_documents').select('id, staff_id, requirement_type_id, name, expires, expiry_date, issue_date, created_at, file_url'),
@@ -237,7 +248,7 @@ module.exports = (app, deps) => {
 
   // ---------------------------------------------------------------- Hojas de vida
   app.get('/estandares/th/personal', auth(STAFF), hx(async (req, res) => {
-    let rows = await loadAll(scopeSite(req))
+    let rows = await loadAll(scopeSite(req), scopeOf(req), Number(req.query.dependencia) || null)
     const q = clean(req.query.q)?.toLowerCase()
     if (q) rows = rows.filter((r) => [r.fullName, r.document, r.positionName, r.profession].some((v) => v && v.toLowerCase().includes(q)))
     if (Number(req.query.cargo)) rows = rows.filter((r) => r.positionId === Number(req.query.cargo))
@@ -288,7 +299,7 @@ module.exports = (app, deps) => {
       address: clean(b.address), city: clean(b.city), profession: clean(b.profession), professional_card: clean(b.professionalCard), rethus: clean(b.rethus),
       eps: clean(b.eps), arl: clean(b.arl), pension_fund: clean(b.pensionFund), severance_fund: clean(b.severanceFund),
       emergency_contact: clean(b.emergencyContact), emergency_phone: V.phone(b.emergencyPhone), position_id: Number(b.positionId) || null,
-      ips_service_id: Number(b.ipsServiceId) || null, user_id: Number(b.userId) || null, notes: clean(b.notes),
+      ips_service_id: Number(b.ipsServiceId) || null, user_id: Number(b.userId) || null, notes: clean(b.notes), dependency_id: Number(b.dependencyId) || null,
       specialty: clean(b.specialty), assigned_service: clean(b.assignedService)?.toUpperCase() ?? null, hire_date: dateOrNull(b.hireDate), status,
       education_level: EDUCATION_LEVELS.includes(b.educationLevel) ? b.educationLevel : null, degree_title: clean(b.degreeTitle), institution: clean(b.institution),
       graduation_year: year, rethus_verified_at: dateOrNull(b.rethusVerifiedAt), active: status !== 'inactivo', updated_at: new Date().toISOString()
@@ -470,7 +481,7 @@ module.exports = (app, deps) => {
 
   // ---------------------------------------------------------------- Dashboard y alertas
   app.get('/estandares/th/resumen', auth(STAFF), hx(async (req, res) => {
-    const rows = (await loadAll(scopeSite(req))).filter((r) => r.active)
+    const rows = (await loadAll(scopeSite(req), scopeOf(req), Number(req.query.dependencia) || null)).filter((r) => r.active)
     const year = new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10)
     const alerts = []
     for (const r of rows) {
@@ -511,22 +522,151 @@ module.exports = (app, deps) => {
     })
   }))
 
-  // IIPS-022 · Avisos de talento humano: contratos, certificados y requisitos.
-  alerts.register({
-    key: 'talento', module: 'talento_humano', route: '/estandares/talento-humano/personal',
-    run: async (req) => {
-      const out = []
-      for (const r of (await loadAll(scopeSite(req))).filter((x) => x.active)) {
-        const push = (kind, level, message, date) => out.push({ id: `${r.id}:${kind}:${date || ''}`, level, title: r.fullName, message, link: `/estandares/talento-humano/personal/${r.id}`, date })
-        const c = r.contract
-        if (!c) push('contrato', 'warn', 'Sin contrato registrado')
-        else if (c.status === 'vencido') push('contrato', 'bad', `Contrato vencido desde el ${c.endDate.split('-').reverse().join('/')}`, c.endDate)
-        else if (c.status === 'por_vencer') push('contrato', 'warn', `Contrato vence en ${c.daysLeft} día${c.daysLeft === 1 ? '' : 's'}`, c.endDate)
-        for (const d of r.expiredDocs) push(`doc${d.id || d.name}`, 'bad', `${d.name} vencido`, d.expiryDate)
-        for (const d of r.expiringDocs) push(`doc${d.id || d.name}`, 'warn', `${d.name} vence en ${d.daysLeft} día${d.daysLeft === 1 ? '' : 's'}`, d.expiryDate)
-        if (r.compliance.missing) push('requisitos', 'bad', `${r.compliance.missing} requisito${r.compliance.missing === 1 ? '' : 's'} obligatorio${r.compliance.missing === 1 ? '' : 's'} sin soporte`)
+  // ================================================================ IIPS-026 · Vacaciones (Código Sustantivo del Trabajo)
+  // Festivos de Colombia (Ley 51 de 1983 "Ley Emiliani" y fiestas móviles según la Pascua).
+  const iso = (d) => d.toISOString().slice(0, 10)
+  const addD = (d, n) => { const x = new Date(d); x.setUTCDate(x.getUTCDate() + n); return x }
+  const nextMonday = (d) => { const w = d.getUTCDay(); return w === 1 ? d : addD(d, (8 - w) % 7) }
+  const easter = (y) => { const a = y % 19; const b = Math.floor(y / 100); const c = y % 100; const d = Math.floor(b / 4); const e = b % 4; const f = Math.floor((b + 8) / 25); const g = Math.floor((b - f + 1) / 3); const h = (19 * a + b - d - g + 15) % 30; const i = Math.floor(c / 4); const k = c % 4; const l = (32 + 2 * e + 2 * i - h - k) % 7; const m = Math.floor((a + 11 * h + 22 * l) / 451); const month = Math.floor((h + l - 7 * m + 114) / 31); const day = ((h + l - 7 * m + 114) % 31) + 1; return new Date(Date.UTC(y, month - 1, day)) }
+  const holidayCache = new Map()
+  const holidays = (y) => {
+    if (holidayCache.has(y)) return holidayCache.get(y)
+    const D = (m, d) => new Date(Date.UTC(y, m - 1, d))
+    const E = easter(y)
+    const list = [D(1, 1), D(5, 1), D(7, 20), D(8, 7), D(12, 8), D(12, 25), addD(E, -3), addD(E, -2),
+      ...[D(1, 6), D(3, 19), D(6, 29), D(8, 15), D(10, 12), D(11, 1), D(11, 11), addD(E, 39), addD(E, 60), addD(E, 68)].map(nextMonday)]
+    const set = new Set(list.map(iso)); holidayCache.set(y, set); return set
+  }
+  const isBusiness = (d) => { const w = d.getUTCDay(); return w !== 0 && w !== 6 && !holidays(d.getUTCFullYear()).has(iso(d)) }
+  // Fecha en que terminan n días hábiles contados desde start (inclusive), y el día de regreso.
+  const vacationEnd = (start, n) => {
+    let d = new Date(`${start}T00:00:00Z`); let count = 0
+    while (!isBusiness(d)) d = addD(d, 1)
+    for (;;) { if (isBusiness(d)) { count += 1; if (count >= n) break } d = addD(d, 1) }
+    let back = addD(d, 1); while (!isBusiness(back)) back = addD(back, 1)
+    return { end: iso(d), returnDate: iso(back) }
+  }
+  // Días trabajados en base comercial de 360 días (método 30/360), como se liquidan las prestaciones.
+  const days360 = (a, b) => { const [y1, m1, d1] = a.split('-').map(Number); const [y2, m2, d2] = b.split('-').map(Number); return (y2 - y1) * 360 + (m2 - m1) * 30 + (Math.min(d2, 30) - Math.min(d1, 30)) + 1 }
+  const vacationStatus = (staff, contracts, taken) => {
+    const direct = contracts.filter((c) => VACATION_CONTRACTS.includes(c.contract_type)).sort((x, y) => x.start_date.localeCompare(y.start_date))
+    const current = direct.filter((c) => !c.end_date || c.end_date >= todayBogota())
+    if (!current.length) return { applies: false, reason: contracts.length ? 'Su tipo de contrato no genera vacaciones (no es vinculación laboral directa).' : 'Sin contrato registrado.' }
+    // Inicio del vínculo: el contrato directo vigente más antiguo encadenado (o la fecha de ingreso si es anterior y hay continuidad).
+    let start = current[0].start_date
+    for (let i = direct.indexOf(current[0]) - 1; i >= 0; i--) { const prev = direct[i]; if (prev.end_date && daysUntil(prev.end_date) <= 0 && Math.abs(toUTC(start) - toUTC(prev.end_date)) <= 2 * 86400000) start = prev.start_date; else break }
+    const today = todayBogota()
+    const worked = Math.max(0, days360(start, today))
+    const accrued = Math.round((worked / 360) * 15 * 100) / 100
+    const used = taken.reduce((a, v) => a + Number(v.business_days), 0)
+    const balance = Math.round((accrued - used) * 100) / 100
+    const periods = Math.floor(worked / 360)
+    const anniversary = new Date(`${start}T00:00:00Z`); anniversary.setUTCFullYear(anniversary.getUTCFullYear() + periods + 1)
+    const upcoming = taken.filter((v) => v.start_date >= today).sort((a, b) => a.start_date.localeCompare(b.start_date))[0] || null
+    return { applies: true, contractType: current[0].contract_type, contractTypeLabel: CONTRACT_TYPES[current[0].contract_type], since: start, workedDays: worked, periods, accrued, taken: used, balance, nextPeriodDate: iso(anniversary), daysToNextPeriod: daysUntil(iso(anniversary)), upcoming: upcoming ? { startDate: upcoming.start_date, endDate: upcoming.end_date, businessDays: Number(upcoming.business_days) } : null }
+  }
+  const vacDTO = (v) => ({ id: v.id, startDate: v.start_date, endDate: v.end_date, businessDays: Number(v.business_days), kind: v.kind, notes: v.notes, createdAt: v.created_at })
+  const vacationsFor = async (staffIds) => {
+    if (!staffIds.length) return { contracts: [], taken: [] }
+    const [c, v] = await Promise.all([
+      supabase.from('th_contracts').select('staff_id, contract_type, start_date, end_date').in('staff_id', staffIds),
+      supabase.from('th_vacations').select('*').in('staff_id', staffIds).order('start_date', { ascending: false })
+    ])
+    if (c.error) throw c.error
+    return { contracts: c.data, taken: v.error ? [] : v.data }
+  }
+  app.get('/estandares/th/personal/:id/vacaciones', auth(STAFF), hx(async (req, res) => {
+    const s = await loadStaff(req)
+    const { contracts, taken } = await vacationsFor([s.id])
+    res.send({ ...vacationStatus(s, contracts, taken), history: taken.map(vacDTO) })
+  }))
+  app.post('/estandares/th/personal/:id/vacaciones', auth(STAFF), hx(async (req, res) => {
+    const s = await loadStaff(req)
+    const b = req.body || {}
+    const start = dateOrNull(b.startDate)
+    const n = Number(b.businessDays)
+    if (!start) return fail(res, 'Indica la fecha de inicio', 400)
+    if (!Number.isFinite(n) || n <= 0 || n > 90) return fail(res, 'Días hábiles inválidos', 400)
+    const kind = b.kind === 'compensadas' ? 'compensadas' : 'disfrute'
+    // CST art. 189: solo se compensa en dinero hasta la mitad de las vacaciones.
+    const { end } = kind === 'compensadas' ? { end: start } : vacationEnd(start, n)
+    const { error } = await supabase.from('th_vacations').insert({ staff_id: s.id, start_date: start, end_date: end, business_days: n, kind, notes: clean(b.notes), created_by: req.user.id })
+    if (error) throw error
+    const { contracts, taken } = await vacationsFor([s.id])
+    res.status(201).send({ ...vacationStatus(s, contracts, taken), history: taken.map(vacDTO) })
+  }))
+  app.delete('/estandares/th/personal/:id/vacaciones/:vid', auth(STAFF), hx(async (req, res) => {
+    const s = await loadStaff(req)
+    const { error } = await supabase.from('th_vacations').delete().eq('id', Number(req.params.vid)).eq('staff_id', s.id)
+    if (error) throw error
+    const { contracts, taken } = await vacationsFor([s.id])
+    res.send({ ...vacationStatus(s, contracts, taken), history: taken.map(vacDTO) })
+  }))
+  // Cálculo de la fecha de regreso (para el formulario).
+  app.get('/estandares/th/vacaciones/calcular', auth(STAFF), hx(async (req, res) => {
+    const start = dateOrNull(req.query.inicio); const n = Number(req.query.dias)
+    if (!start || !(n > 0)) return fail(res, 'Datos inválidos', 400)
+    res.send(vacationEnd(start, n))
+  }))
+  // Tablero de vacaciones: saldo de cada persona con contrato laboral.
+  app.get('/estandares/th/vacaciones', auth(STAFF), hx(async (req, res) => {
+    const rows = (await loadAll(scopeSite(req), scopeOf(req), Number(req.query.dependencia) || null)).filter((r) => r.active)
+    const { contracts, taken } = await vacationsFor(rows.map((r) => r.id))
+    res.send(rows.map((r) => ({ id: r.id, fullName: r.fullName, document: r.document, positionName: r.positionName, dependencyName: r.dependencyName, siteName: r.siteName, vacation: vacationStatus(r, contracts.filter((c) => c.staff_id === r.id), taken.filter((v) => v.staff_id === r.id)) })))
+  }))
+
+  // IIPS-022/026 · Avisos de talento humano: contratos, certificados, requisitos y vacaciones.
+  // Uno para el personal de IPS y otro para las demás dependencias (módulo de talento humano general).
+  const thAlerts = (scope, base) => async (req) => {
+    const out = []
+    const rows = (await loadAll(scopeSite(req), scope)).filter((x) => x.active)
+    const { contracts, taken } = await vacationsFor(rows.map((r) => r.id))
+    for (const r of rows) {
+      const push = (kind, level, message, date) => out.push({ id: `${r.id}:${kind}:${date || ''}`, level, title: r.fullName, message, link: `${base}/${r.id}`, date })
+      const c = r.contract
+      if (!c) push('contrato', 'warn', 'Sin contrato registrado')
+      else if (c.status === 'vencido') push('contrato', 'bad', `Contrato vencido desde el ${c.endDate.split('-').reverse().join('/')}`, c.endDate)
+      else if (c.status === 'por_vencer') push('contrato', 'warn', `Contrato vence en ${c.daysLeft} día${c.daysLeft === 1 ? '' : 's'}`, c.endDate)
+      for (const d of r.expiredDocs) push(`doc${d.id || d.name}`, 'bad', `${d.name} vencido`, d.expiryDate)
+      for (const d of r.expiringDocs) push(`doc${d.id || d.name}`, 'warn', `${d.name} vence en ${d.daysLeft} día${d.daysLeft === 1 ? '' : 's'}`, d.expiryDate)
+      if (r.compliance.missing) push('requisitos', 'bad', `${r.compliance.missing} requisito${r.compliance.missing === 1 ? '' : 's'} obligatorio${r.compliance.missing === 1 ? '' : 's'} sin soporte`)
+      const v = vacationStatus(r, contracts.filter((x) => x.staff_id === r.id), taken.filter((x) => x.staff_id === r.id))
+      if (v.applies) {
+        if (v.balance >= 30) push('vac2', 'bad', `Acumula ${Math.floor(v.balance)} días de vacaciones (dos periodos o más)`)
+        else if (v.balance >= 15) push(`vac:${v.periods}`, 'warn', `Tiene ${Math.floor(v.balance)} días de vacaciones pendientes por disfrutar`)
+        else if (v.daysToNextPeriod <= 30) push(`vacprox:${v.nextPeriodDate}`, 'info', `Cumple un año de servicio el ${v.nextPeriodDate.split('-').reverse().join('/')}: le corresponden 15 días hábiles de vacaciones`, v.nextPeriodDate)
+        if (v.upcoming && daysUntil(v.upcoming.startDate) <= 15) push(`vacsal:${v.upcoming.startDate}`, 'info', `Sale a vacaciones el ${v.upcoming.startDate.split('-').reverse().join('/')} (${v.upcoming.businessDays} días hábiles)`, v.upcoming.startDate)
       }
-      return out
     }
-  })
+    return out
+  }
+  alerts.register({ key: 'talento', module: 'talento_humano', route: '/estandares/talento-humano/personal', run: thAlerts('ips', '/estandares/talento-humano/personal') })
+  alerts.register({ key: 'talento_general', module: 'th_general', route: '/talento-humano/personal', run: thAlerts('general', '/talento-humano/personal') })
+
+  // ---------------------------------------------------------------- Dependencias (personal no IPS)
+  app.post('/estandares/th/dependencias', auth(ADMIN), hx(async (req, res) => {
+    const name = clean(req.body?.name)
+    if (!name) return fail(res, 'Escribe el nombre de la dependencia', 400)
+    const { data, error } = await supabase.from('th_dependencies').insert({ name: name.slice(0, 80), sort_order: Number(req.body?.sortOrder) || 99 }).select('id, name, active').single()
+    if (error) { if (error.code === '23505') return fail(res, 'Ya existe esa dependencia', 409); throw error }
+    res.status(201).send(data)
+  }))
+  app.put('/estandares/th/dependencias/:id', auth(ADMIN), hx(async (req, res) => {
+    const row = {}
+    if (clean(req.body?.name)) row.name = clean(req.body.name).slice(0, 80)
+    if ('active' in (req.body || {})) row.active = Boolean(req.body.active)
+    const { data, error } = await supabase.from('th_dependencies').update(row).eq('id', Number(req.params.id)).select('id, name, active').single()
+    if (error) throw error
+    res.send(data)
+  }))
+
+  // ---------------------------------------------------------------- Mi hoja de vida (dashboard de cada usuario)
+  app.get('/mi-hoja-de-vida', auth(), hx(async (req, res) => {
+    let { data: s } = await supabase.from('th_staff').select(STAFF_SELECT).eq('user_id', req.user.id).maybeSingle()
+    if (!s && req.user.identification) s = (await supabase.from('th_staff').select(STAFF_SELECT).eq('document', String(req.user.identification).replace(/\s+/g, '')).maybeSingle()).data
+    if (!s) return res.send({ staff: null })
+    const detail = await staffDetail(s)
+    const { contracts, taken } = await vacationsFor([s.id])
+    res.send({ staff: detail, vacation: { ...vacationStatus(s, contracts, taken), history: taken.map(vacDTO) } })
+  }))
 }

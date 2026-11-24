@@ -79,9 +79,9 @@ const IPS_MODULES = ['cadena_frio', 'citologia', 'ambulancias'] // módulos del 
 // Módulos por usuario: el administrador puede mostrar u ocultar módulos a cada usuario.
 // users.modules = null usa los del rol; un arreglo los reemplaza. El administrador ve todo.
 // ======================================================================
-const MODULE_KEYS = ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes', 'edu_portal', 'edu_docente']
+const MODULE_KEYS = ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'traslado', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'voluntario', 'talento_humano', 'th_general', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes', 'edu_portal', 'edu_docente']
 const ROLE_MODULES = {
-  empleado: ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes'],
+  empleado: ['ips_dashboard', 'citologias', 'facturacion', 'vacunacion', 'temperatura', 'equipos', 'og_dashboard', 'socorro', 'educacion', 'personas', 'reporte_voluntarios', 'inventario', 'flota', 'talento_humano', 'th_general', 'procesos_prioritarios', 'interdependencia', 'medicamentos', 'infraestructura', 'historia_clinica', 'doc_generales', 'edu_dashboard', 'edu_programas', 'edu_estudiantes'],
   voluntario: ['socorro', 'educacion', 'voluntario'],
   conductor: ['flota', 'traslado'],
   estudiante: ['edu_portal'], // Académico ETDH: portal del estudiante
@@ -89,7 +89,9 @@ const ROLE_MODULES = {
   administrador: MODULE_KEYS
 }
 // El plan contratado (plataforma) limita los módulos de todos, incluido el administrador.
-const inPlan = (m) => !platform.state.modules || platform.state.modules.includes(m)
+// IIPS-026: el talento humano de otras dependencias viene con el de IPS en el plan.
+const PLAN_ALIAS = { th_general: 'talento_humano' }
+const inPlan = (m) => !platform.state.modules || platform.state.modules.includes(m) || (PLAN_ALIAS[m] && platform.state.modules.includes(PLAN_ALIAS[m]))
 // Funciones del plan que no son módulos del menú (p. ej. envío de documentos, recordatorios automáticos).
 const hasFeature = (k) => !platform.state.features || platform.state.features.includes(k)
 const userModules = (u) => (u.role === 'administrador' ? MODULE_KEYS : Array.isArray(u.modules) ? u.modules.filter((m) => MODULE_KEYS.includes(m)) : ROLE_MODULES[u.role] || []).filter(inPlan)
@@ -99,7 +101,7 @@ const ROUTE_MODULES = [
   ['/facturacion', ['facturacion']], ['/calidad', ['doc_generales', 'edu_programas', 'edu_dashboard', 'edu_estudiantes']], ['/vacunacion', ['vacunacion']],
   ['/registrar-temperatura', ['temperatura']], ['/reporte-temperatura', ['temperatura']], ['/temperatura', ['temperatura']],
   ['/ambulancias-dashboard', ['traslado']], ['/equipos', ['equipos']], ['/dashboard', ['ips_dashboard']],
-  ['/estandares/th', ['talento_humano']], ['/estandares/documentos/procesos_prioritarios', ['procesos_prioritarios']], ['/estandares/documentos/interdependencia', ['interdependencia']], ['/estandares/documentos/medicamentos', ['medicamentos']], ['/estandares/documentos/infraestructura', ['infraestructura']], ['/estandares/documentos/historia_clinica', ['historia_clinica']], ['/socorro/dashboard', ['og_dashboard']], ['/socorro/reporte-voluntarios', ['reporte_voluntarios']], ['/socorro/eventos', ['socorro', 'educacion']], ['/socorro/inventario', ['socorro', 'educacion']],
+  ['/estandares/th', ['talento_humano', 'th_general']], ['/estandares/documentos/procesos_prioritarios', ['procesos_prioritarios']], ['/estandares/documentos/interdependencia', ['interdependencia']], ['/estandares/documentos/medicamentos', ['medicamentos']], ['/estandares/documentos/infraestructura', ['infraestructura']], ['/estandares/documentos/historia_clinica', ['historia_clinica']], ['/socorro/dashboard', ['og_dashboard']], ['/socorro/reporte-voluntarios', ['reporte_voluntarios']], ['/socorro/eventos', ['socorro', 'educacion']], ['/socorro/inventario', ['socorro', 'educacion']],
   ['/socorro/personas', ['personas', 'socorro', 'educacion']], ['/inventario', ['inventario']], ['/voluntario/panel', ['voluntario']],
   ['/vehiculos', ['flota', 'traslado']],
   ['/academico/resumen', ['edu_dashboard']], ['/academico/programas', ['edu_programas', 'edu_estudiantes']], ['/academico/grupos', ['edu_programas', 'edu_estudiantes', 'edu_docente']],
