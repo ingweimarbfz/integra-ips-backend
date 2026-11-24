@@ -4,8 +4,12 @@
 // y la estampa en los documentos y reportes que tienen líneas de firma.
 // La firma estampada queda congelada (copia de la imagen y del nombre al momento de firmar).
 // =====================================================================
+const alerts = require('./alerts')
+
 module.exports = (app, deps) => {
-  const { supabase, auth, h, fail, clean, ADMIN, uploadImage, removeStoredFile, canAccessSite } = deps
+  const { supabase, auth, h, fail, clean, ADMIN, uploadImage, removeStoredFile, canAccessSite, directors } = deps
+  // IIPS-023: casillas de dirección → las firma el director del área (o el administrador); sin director, la regla anterior.
+  const dir = (req, area, serviceId, fallback) => (directors ? directors.requireDirector(req, area, serviceId, fallback) : fallback())
   const IMG = ['image/png', 'image/jpeg', 'image/svg+xml']
   const STAFF = ['administrador', 'empleado']
   const httpError = (status, message) => Object.assign(new Error(message), { status })
@@ -60,6 +64,7 @@ module.exports = (app, deps) => {
     return data
   }
   const siteOf = (req, siteId) => { if (siteId && !canAccessSite(req, siteId)) throw httpError(404, 'Documento no encontrado') }
+  const serviceIdOf = async (module) => (await supabase.from('ips_services').select('id').eq('module', module).maybeSingle()).data?.id || null
   const isStaffSelf = (s, u) => (s.user_id && s.user_id === u.id) || (s.document && s.document === u.identification)
   const RULES = {
     citologia: async (req, key, slot) => {
@@ -70,7 +75,7 @@ module.exports = (app, deps) => {
       if (norm(expected) !== norm(fullName(req.user))) throw httpError(403, `Solo ${expected || 'la persona indicada'} puede firmar esta casilla`)
     },
     evento: async (req, key, slot) => {
-      const e = await loadOne('gso_events', 'id, site_id, coordinator:volunteers!gso_events_coordinator_id_fkey(document, first_name, last_name)', key)
+      const e = await loadOne('gso_events', 'id, site_id, area, coordinator:volunteers!gso_events_coordinator_id_fkey(document, first_name, last_name)', key)
       siteOf(req, e.site_id)
       if (/^usuario_\d+$/.test(slot)) {
         const uid = Number(slot.split('_')[1])
@@ -85,49 +90,52 @@ module.exports = (app, deps) => {
       } else if (slot === 'coordinador') {
         if (e.coordinator?.document !== req.user.identification) throw httpError(403, `Solo el coordinador (${e.coordinator?.first_name} ${e.coordinator?.last_name}) puede firmar esta casilla`)
       } else if (slot === 'direccion') {
-        if (!STAFF.includes(req.user.role)) throw httpError(403, 'Esta casilla la firma la dirección (administrador o empleado)')
+        await dir(req, e.area === 'educacion' && directors && await directors.directorFor('educacion') ? 'educacion' : 'socorro_operaciones', null, () => { if (!STAFF.includes(req.user.role)) throw httpError(403, 'Esta casilla la firma la dirección (administrador o empleado)') })
       } else throw httpError(400, 'Casilla de firma inválida')
     },
     reporte_vehiculo: async (req, key, slot) => {
       const t = await loadOne('vehicle_trips', 'id, driver_id', key)
-      if (slot === 'conductor') { if (t.driver_id !== req.user.id) throw httpError(403, 'Solo el conductor del reporte puede firmar esta casilla') } else if (slot === 'reviso') { if (req.user.role !== 'administrador') throw httpError(403, 'Esta casilla la firma el administrador') } else throw httpError(400, 'Casilla de firma inválida')
+      if (slot === 'conductor') { if (t.driver_id !== req.user.id) throw httpError(403, 'Solo el conductor del reporte puede firmar esta casilla') } else if (slot === 'reviso') { await dir(req, 'socorro_operaciones', null, () => { if (req.user.role !== 'administrador') throw httpError(403, 'Esta casilla la firma el administrador') }) } else throw httpError(400, 'Casilla de firma inválida')
     },
     preoperacional: async (req, key, slot) => {
       const t = await loadOne('vehicle_inspections', 'id, driver_id', key)
-      if (slot === 'conductor') { if (t.driver_id !== req.user.id) throw httpError(403, 'Solo el conductor del preoperacional puede firmar esta casilla') } else if (slot === 'reviso') { if (req.user.role !== 'administrador') throw httpError(403, 'Esta casilla la firma el administrador de flota') } else throw httpError(400, 'Casilla de firma inválida')
+      if (slot === 'conductor') { if (t.driver_id !== req.user.id) throw httpError(403, 'Solo el conductor del preoperacional puede firmar esta casilla') } else if (slot === 'reviso') { await dir(req, 'socorro_operaciones', null, () => { if (req.user.role !== 'administrador') throw httpError(403, 'Esta casilla la firma el administrador de flota') }) } else throw httpError(400, 'Casilla de firma inválida')
     },
     // Reportes generados: la clave es el alcance y el periodo (p. ej. "2:2026-10").
     temperatura: async (req, key, slot) => {
       if (!STAFF.includes(req.user.role)) throw httpError(403, 'Sin permiso para firmar este reporte')
       const site = Number(String(key).split(':')[0]); if (site) siteOf(req, site)
       if (!['genero', 'responsable'].includes(slot)) throw httpError(400, 'Casilla de firma inválida')
+      if (slot === 'responsable') await dir(req, 'ips', await serviceIdOf('cadena_frio'))
     },
     inventario: async (req, key, slot) => {
       if (!STAFF.includes(req.user.role)) throw httpError(403, 'Sin permiso para firmar este reporte')
       if (!['genero', 'responsable'].includes(slot)) throw httpError(400, 'Casilla de firma inválida')
+      if (slot === 'responsable') await dir(req, 'socorro_operaciones', null)
     },
     equipo: async (req, key, slot) => {
-      const e = await loadOne('equipment', 'id, site_id', key)
+      const e = await loadOne('equipment', 'id, site_id, service_id', key)
       siteOf(req, e.site_id)
       if (!STAFF.includes(req.user.role)) throw httpError(403, 'Sin permiso para firmar esta hoja de vida')
       if (!['mantenimiento', 'coordinacion'].includes(slot)) throw httpError(400, 'Casilla de firma inválida')
+      if (slot === 'coordinacion') await dir(req, 'ips', e.service_id)
     },
     // Talento humano: el profesional firma su hoja de vida y su lista de chequeo; quien verifica y la coordinación firman la suya.
     th_chequeo: async (req, key, slot) => {
       const c = await loadOne('th_checklists', 'id, reviewer_id, staff:th_staff(site_id, user_id, document, first_name, last_name)', key)
       siteOf(req, c.staff.site_id)
-      if (slot === 'verifica') { if (c.reviewer_id !== req.user.id) throw httpError(403, 'Solo quien realizó la verificación puede firmar esta casilla') } else if (slot === 'profesional') { if (!isStaffSelf(c.staff, req.user)) throw httpError(403, `Solo ${c.staff.first_name} ${c.staff.last_name} puede firmar esta casilla`) } else if (slot === 'coordinacion') { if (!STAFF.includes(req.user.role)) throw httpError(403, 'La casilla Revisó la firma la coordinación') } else throw httpError(400, 'Casilla de firma inválida')
+      if (slot === 'verifica') { if (c.reviewer_id !== req.user.id) throw httpError(403, 'Solo quien realizó la verificación puede firmar esta casilla') } else if (slot === 'profesional') { if (!isStaffSelf(c.staff, req.user)) throw httpError(403, `Solo ${c.staff.first_name} ${c.staff.last_name} puede firmar esta casilla`) } else if (slot === 'coordinacion') { await dir(req, 'talento_humano', null, () => { if (!STAFF.includes(req.user.role)) throw httpError(403, 'La casilla Revisó la firma la coordinación') }) } else throw httpError(400, 'Casilla de firma inválida')
     },
     // Verificación de carpeta obligatoria de un estándar (p. ej. interdependencia): Verificó y Revisó.
     std_chequeo: async (req, key, slot) => {
       const c = await loadOne('std_checklists', 'id, site_id, reviewer_id', key)
       siteOf(req, c.site_id)
-      if (slot === 'verifica') { if (c.reviewer_id !== req.user.id) throw httpError(403, 'Solo quien realizó la verificación puede firmar esta casilla') } else if (slot === 'revisa') { if (!STAFF.includes(req.user.role)) throw httpError(403, 'La casilla Revisó la firma la coordinación') } else throw httpError(400, 'Casilla de firma inválida')
+      if (slot === 'verifica') { if (c.reviewer_id !== req.user.id) throw httpError(403, 'Solo quien realizó la verificación puede firmar esta casilla') } else if (slot === 'revisa') { await dir(req, 'ips', null, () => { if (!STAFF.includes(req.user.role)) throw httpError(403, 'La casilla Revisó la firma la coordinación') }) } else throw httpError(400, 'Casilla de firma inválida')
     },
     th_hoja_vida: async (req, key, slot) => {
       const s = await loadOne('th_staff', 'id, site_id, user_id, document, first_name, last_name', key)
       siteOf(req, s.site_id)
-      if (slot === 'profesional') { if (!isStaffSelf(s, req.user)) throw httpError(403, `Solo ${s.first_name} ${s.last_name} puede firmar esta casilla`) } else if (slot === 'talento_humano') { if (!STAFF.includes(req.user.role)) throw httpError(403, 'Esta casilla la firma talento humano') } else throw httpError(400, 'Casilla de firma inválida')
+      if (slot === 'profesional') { if (!isStaffSelf(s, req.user)) throw httpError(403, `Solo ${s.first_name} ${s.last_name} puede firmar esta casilla`) } else if (slot === 'talento_humano') { await dir(req, 'talento_humano', null, () => { if (!STAFF.includes(req.user.role)) throw httpError(403, 'Esta casilla la firma talento humano') }) } else throw httpError(400, 'Casilla de firma inválida')
     }
   }
   const sigDTO = (s) => ({ id: s.id, slot: s.slot, userId: s.user_id, signerName: s.signer_name, signerIdentification: s.signer_identification, signatureUrl: s.signature_url, signedAt: s.signed_at })
@@ -160,7 +168,7 @@ module.exports = (app, deps) => {
   // ---------------------------------------------------------------- Pendientes por firmar del usuario
   // Solo las casillas que tienen un firmante definido: el profesional de la citología, el coordinador del evento,
   // el conductor del reporte/preoperacional y, para el administrador, el "Revisó" de flota (últimos 30 días).
-  const SLOT_LABELS = { elabora: 'Elaboró historia', toma_muestra: 'Tomó la muestra', coordinador: 'Coordinador', conductor: 'Conductor', reviso: 'Revisó', persona: 'Salida de personal', verifica: 'Verificó', profesional: 'Profesional', coordinacion: 'Revisó', revisa: 'Revisó' }
+  const SLOT_LABELS = { elabora: 'Elaboró historia', toma_muestra: 'Tomó la muestra', coordinador: 'Coordinador', conductor: 'Conductor', reviso: 'Revisó', persona: 'Salida de personal', verifica: 'Verificó', profesional: 'Profesional', coordinacion: 'Revisó', revisa: 'Revisó', direccion: 'Revisó (dirección)' }
   const pendingFor = async (user) => {
     const name = norm(fullName(user))
     const since = new Date(Date.now() - 30 * 86400000).toISOString()
@@ -172,7 +180,7 @@ module.exports = (app, deps) => {
         : supabase.from('vehicle_trips').select('id, code, activity, driver_id, status, ended_at, vehicles(movil)').eq('driver_id', user.id).eq('status', 'cerrado').order('ended_at', { ascending: false }).limit(100),
       admin ? supabase.from('vehicle_inspections').select('id, code, driver_id, inspected_at, result, vehicles(movil)').gte('inspected_at', since).order('inspected_at', { ascending: false })
         : supabase.from('vehicle_inspections').select('id, code, driver_id, inspected_at, result, vehicles(movil)').eq('driver_id', user.id).order('inspected_at', { ascending: false }).limit(100),
-      supabase.from('document_signatures').select('doc_type, doc_key, slot').in('doc_type', ['citologia', 'evento', 'reporte_vehiculo', 'preoperacional', 'th_chequeo', 'std_chequeo']),
+      supabase.from('document_signatures').select('doc_type, doc_key, slot').in('doc_type', ['citologia', 'evento', 'reporte_vehiculo', 'preoperacional', 'th_chequeo', 'std_chequeo', 'equipo']),
       supabase.from('th_checklists').select('id, code, check_date, result, reviewer_id, staff:th_staff(id, user_id, document, first_name, last_name)').order('check_date', { ascending: false }).limit(300),
       supabase.from('std_checklists').select('id, kind, code, standard, check_date, result, site:sites(name)').eq('reviewer_id', user.id).order('check_date', { ascending: false }).limit(100)
     ])
@@ -219,6 +227,53 @@ module.exports = (app, deps) => {
     const STD_ROUTE = { interdependencia: 'interdependencia', procesos_prioritarios: 'procesos-prioritarios', medicamentos: 'medicamentos', infraestructura: 'infraestructura', historia_clinica: 'historia-clinica' }
     const STD_LABEL = { interdependencia: 'Interdependencia', procesos_prioritarios: 'Procesos prioritarios', medicamentos: 'Medicamentos y dispositivos', infraestructura: 'Infraestructura', historia_clinica: 'Historia clínica' }
     for (const c of stc.data) add({ docType: 'std_chequeo', docKey: String(c.id), slot: 'verifica', title: `${c.kind === 'seguimiento' ? 'Seguimiento' : 'Verificación de carpeta'} ${c.code}`, subtitle: `${STD_LABEL[c.standard] || c.standard} · ${c.site?.name || 'General'} · ${c.result === 'cumple' ? 'Cumple' : 'No cumple'}`, date: c.check_date, link: `/estandares/${STD_ROUTE[c.standard] || c.standard}/${c.kind === 'seguimiento' ? 'seguimiento' : 'verificacion'}/${c.id}` })
+    // IIPS-023 · Bandeja del director: las casillas de dirección de su área (últimos 60 días).
+    const areas = directors ? await directors.areasOf(user.id) : []
+    if (areas.length) {
+      const since60 = new Date(Date.now() - 60 * 86400000).toISOString()
+      const has = (a) => areas.some((x) => x.area === a)
+      const mark = new Set(out.map((o) => `${o.docType}|${o.docKey}|${o.slot}`))
+      const addD = (o) => { const k = `${o.docType}|${o.docKey}|${o.slot}`; if (!mark.has(k)) { mark.add(k); add({ ...o, asDirector: true }) } }
+      const eduDirector = directors && await directors.directorFor('educacion')
+      if (has('socorro_operaciones') || has('educacion')) {
+        const { data: evs } = await supabase.from('gso_events').select('id, code, name, area, ended_at').eq('status', 'finalizado').gte('ended_at', since60).order('ended_at', { ascending: false })
+        for (const e of evs || []) {
+          const areaOf = e.area === 'educacion' && eduDirector ? 'educacion' : 'socorro_operaciones'
+          if (has(areaOf)) addD({ docType: 'evento', docKey: String(e.id), slot: 'direccion', title: `${e.area === 'educacion' ? 'Actividad' : 'Evento'} ${e.code}`, subtitle: e.name, date: e.ended_at, link: `/socorro/${e.area === 'educacion' ? 'educacion' : 'eventos'}/${e.id}?reporte=1` })
+        }
+      }
+      if (has('socorro_operaciones')) {
+        const [tr, ins] = await Promise.all([
+          supabase.from('vehicle_trips').select('id, code, activity, ended_at, vehicles(movil)').eq('status', 'cerrado').gte('ended_at', since60).order('ended_at', { ascending: false }),
+          supabase.from('vehicle_inspections').select('id, code, inspected_at, result, vehicles(movil)').gte('inspected_at', since60).order('inspected_at', { ascending: false })
+        ])
+        for (const t of tr.data || []) addD({ docType: 'reporte_vehiculo', docKey: String(t.id), slot: 'reviso', title: `Reporte diario ${t.code}`, subtitle: `Móvil ${t.vehicles?.movil ?? ''} · ${t.activity}`, date: t.ended_at, link: `/socorro/vehiculos/reportes/${t.id}` })
+        for (const r of ins.data || []) addD({ docType: 'preoperacional', docKey: String(r.id), slot: 'reviso', title: `Preoperacional ${r.code}`, subtitle: `Móvil ${r.vehicles?.movil ?? ''} · ${r.result === 'apto' ? 'Apto' : 'No apto'}`, date: r.inspected_at, link: `/socorro/vehiculos/preoperacional/${r.id}` })
+      }
+      if (has('talento_humano')) {
+        const { data: sig2 } = await supabase.from('document_signatures').select('doc_key, slot').eq('doc_type', 'th_chequeo')
+        const done2 = new Set((sig2 || []).map((x) => `${x.doc_key}|${x.slot}`))
+        for (const c of thc.data) {
+          // El director revisa la lista cuando quien verificó ya firmó.
+          if (!done2.has(`${c.id}|verifica`)) continue
+          addD({ docType: 'th_chequeo', docKey: String(c.id), slot: 'coordinacion', title: `Lista de chequeo ${c.code}`, subtitle: `${c.staff.first_name} ${c.staff.last_name} · ${c.result === 'cumple' ? 'Cumple' : 'No cumple'}`, date: c.check_date, link: `/estandares/talento-humano/chequeo/${c.id}` })
+        }
+      }
+      if (has('ips')) {
+        const general = areas.some((x) => x.area === 'ips' && !x.serviceId)
+        const svcIds = areas.filter((x) => x.area === 'ips' && x.serviceId).map((x) => x.serviceId)
+        let q = supabase.from('equipment').select('id, code, name, service_id').neq('status', 'dado_de_baja').order('code').limit(300)
+        if (!general) q = q.in('service_id', svcIds.length ? svcIds : [0])
+        const { data: eqs } = await q
+        const { data: sig3 } = await supabase.from('document_signatures').select('doc_key, slot').eq('doc_type', 'equipo')
+        const done3 = new Set((sig3 || []).map((x) => `${x.doc_key}|${x.slot}`))
+        for (const e of eqs || []) if (done3.has(`${e.id}|mantenimiento`)) addD({ docType: 'equipo', docKey: String(e.id), slot: 'coordinacion', title: `Hoja de vida ${e.code}`, subtitle: e.name, link: `/equipos/${e.id}` })
+        if (general) {
+          const { data: stc2 } = await supabase.from('std_checklists').select('id, kind, code, standard, check_date, result, site:sites(name)').gte('check_date', since60.slice(0, 10)).order('check_date', { ascending: false })
+          for (const c of stc2 || []) addD({ docType: 'std_chequeo', docKey: String(c.id), slot: 'revisa', title: `${c.kind === 'seguimiento' ? 'Seguimiento' : 'Verificación de carpeta'} ${c.code}`, subtitle: `${STD_LABEL[c.standard] || c.standard} · ${c.site?.name || 'General'}`, date: c.check_date, link: `/estandares/${STD_ROUTE[c.standard] || c.standard}/${c.kind === 'seguimiento' ? 'seguimiento' : 'verificacion'}/${c.id}` })
+        }
+      }
+    }
     return out.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))
   }
 
@@ -256,4 +311,12 @@ module.exports = (app, deps) => {
     if (error) throw error
     res.send({ message: 'Firma retirada' })
   }))
+
+  // IIPS-023 · Documentos por firmar en la campana y en "Mi firma digital" (los del director, como pendientes por atender).
+  alerts.register({
+    key: 'firmas', route: '/firma',
+    run: async (req) => (await pendingFor(req.user)).slice(0, 120).map((x) => ({
+      id: `${x.docType}:${x.docKey}:${x.slot}`, level: x.asDirector ? 'warn' : 'info', title: x.title, message: `Por firmar: ${x.slotLabel || x.slot}${x.subtitle ? ` · ${x.subtitle}` : ''}`, link: x.link, date: x.date ? String(x.date).slice(0, 10) : undefined
+    }))
+  })
 }
