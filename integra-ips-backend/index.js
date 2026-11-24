@@ -1413,11 +1413,13 @@ require('./talento')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, tod
 require('./estandares')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
 // Calidad IPS · Documentos generales (ítems principales y carpetas hasta 3 niveles).
 require('./calidad')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, userHas: (u, m) => userModules(u).includes(m) })
-require('./academico')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, uploadImage, notifier: () => notifier })
+require('./academico')(app, { directors: () => directors, supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, uploadImage, notifier: () => notifier })
 const plt = platform.register(app, { supabase, auth, h, fail, clean, JWT_SECRET, ISO_DATE, MODULE_KEYS })
 legal = require('./legal')(app, { supabase, auth, h, fail, clean, ADMIN, platform: plt, pauth: plt.pauth })
 require('./search')(app, { supabase, auth, h, fail, clean, userModules, ...SCOPE })
-require('./signatures')(app, { supabase, auth, h, fail, clean, ADMIN, uploadImage, removeStoredFile, canAccessSite })
+// IIPS-023 · Directores de área (firman los reportes de su área).
+const directors = require('./directors')(app, { supabase, auth, h, fail, ADMIN })
+require('./signatures')(app, { supabase, auth, h, fail, clean, ADMIN, uploadImage, removeStoredFile, canAccessSite, directors })
 require('./vehicles')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })
 
 // IIPS-022 · Centro de notificaciones: burbujas por ítem del menú, campana y toasts (ver alerts.js).

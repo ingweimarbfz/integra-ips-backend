@@ -1406,7 +1406,8 @@ module.exports = (app, deps) => {
   const ATT_STATUS = { presente: 'Presente', tarde: 'Llegó tarde', excusa: 'Excusa', ausente: 'Ausente' }
   const attended = (st) => st === 'presente' || st === 'tarde'
   const SIG_TYPES = ['image/png', 'image/jpeg']
-  const isDirector = async (req) => req.user.role === 'administrador' || Number((await settingsOf()).directorUserId) === Number(req.user.id)
+  const isDirector = async (req) => req.user.role === 'administrador' || Number((await settingsOf()).directorUserId) === Number(req.user.id) ||
+    (deps.directors ? (await deps.directors().directorFor('educacion'))?.userId === req.user.id : false)
   // Firma de quien cierra o firma el acta: la de "Mi firma digital" o una dibujada en el momento.
   const signatureFor = async (req, drawn, prefix) => {
     if (drawn) { const url = await uploadImage('signatures', prefix, drawn, SIG_TYPES); if (!url) throw httpError(400, 'Firma inválida'); return url }
@@ -2040,6 +2041,15 @@ module.exports = (app, deps) => {
   }))
 
   // IIPS-022 · Avisos del docente: clases dictadas sin cerrar la asistencia y entregas por revisar.
+  // IIPS-023 · Actas de asistencia que esperan la firma del director de educación.
+  alerts.register({
+    key: 'edu_actas', route: '/educacion/actas', roles: ['administrador', 'empleado'],
+    run: async (req) => {
+      if (!(await isDirector(req))) return []
+      const rows = await must(supabase.from('edu_sessions').select('id, date, group:edu_groups(code), subject:edu_subjects(name)').not('teacher_signed_at', 'is', null).is('director_signed_at', null).order('date').limit(60))
+      return rows.map((x) => ({ id: x.id, level: 'warn', title: `Acta ${x.subject?.name || ''} · ${x.group?.code || ''}`, message: `Pendiente de tu firma (${x.date.split('-').reverse().join('/')})`, link: `/educacion/clases/${x.id}/acta`, date: x.date }))
+    }
+  })
   alerts.register({
     key: 'docente_clases', module: 'edu_docente', roles: ['docente'], route: '/educacion/docente',
     run: async (req) => {
