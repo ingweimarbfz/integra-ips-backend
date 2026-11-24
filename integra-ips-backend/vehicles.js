@@ -60,6 +60,8 @@ module.exports = (app, deps) => {
     id: t.id, code: t.code, status: t.status, activity: t.activity,
     event: t.gso_events ? { id: t.gso_events.id, code: t.gso_events.code, name: t.gso_events.name, status: t.gso_events.status } : null,
     canClose: t.status === 'abierto' && (!t.gso_events || t.gso_events.status !== 'en_curso'),
+    // IIPS-024: insumos gastados de la dotación de la ambulancia.
+    supplies: (t.vehicle_trip_supplies || []).sort((a, b) => a.id - b.id).map((x) => ({ id: x.id, quantity: Number(x.quantity), observation: x.observation, createdAt: x.created_at, item: x.item ? { id: x.item.id, code: x.item.code, name: x.item.name, unit: x.item.unit, lot: x.item.lot, expiryDate: x.item.expiry_date, warehouseName: x.item.warehouse?.name ?? null } : null })),
     vehicle: t.vehicles ? { id: t.vehicles.id, movil: t.vehicles.movil, plate: t.vehicles.plate, vehicleType: t.vehicles.vehicle_type, brand: t.vehicles.brand, line: t.vehicles.line } : null,
     driver: t.driver ? { id: t.driver.id, name: fullName(t.driver), identification: t.driver.identification } : null,
     startedAt: t.started_at, endedAt: t.ended_at, recordedAt: t.created_at, kmOut: Number(t.km_out), kmIn: t.km_in == null ? null : Number(t.km_in),
@@ -96,7 +98,7 @@ module.exports = (app, deps) => {
     companion_name: clean(x.companionName), companion_phone: V.phone(x.companionPhone), authorization_number: clean(x.authorizationNumber),
     receiving_professional: clean(x.receivingProfessional), notes: clean(x.notes)
   })
-  const TRIP_SELECT = '*, vehicle_transfers(*), vehicles(id, movil, plate, vehicle_type, brand, line), driver:users!vehicle_trips_driver_id_fkey(id, name, last_name, identification), gso_events(id, code, name, status)'
+  const TRIP_SELECT = '*, vehicle_transfers(*), vehicles(id, movil, plate, vehicle_type, brand, line), driver:users!vehicle_trips_driver_id_fkey(id, name, last_name, identification), gso_events(id, code, name, status), vehicle_trip_supplies(id, quantity, observation, created_at, item:inventory_items(id, code, name, unit, lot, expiry_date, warehouse:warehouses(name)))'
 
   // Alertas de un vehículo: SOAT/documentos por vencer y mantenimiento preventivo próximo (fecha o km).
   const alertsFor = (v, docs, maints) => {
@@ -737,4 +739,52 @@ module.exports = (app, deps) => {
       id: `${v.id}:${a.kind}:${a.date || ''}`, level: a.level, title: `Móvil ${v.movil} · ${v.plate}`, message: a.message, link: `/socorro/vehiculos/flota/${v.id}`, date: a.date
     })))
   })
+
+  // ================================================================ IIPS-024 · Insumos de la dotación de la ambulancia
+  // El conductor (o el administrador) registra lo que se gastó en la actividad o el traslado; se descuenta de la
+  // dotación de esa móvil (bodega tipo ambulancia), así se sabe qué vehículo gasta qué insumos.
+  const supplyWindowOk = (t) => t.status === 'abierto' || (t.ended_at && Date.now() - new Date(t.ended_at).getTime() < 48 * 3600000)
+  const canEditSupplies = (req, t) => req.user.role === 'administrador' || t.driver_id === req.user.id
+  const ambulanceStock = async (vehicleId) => {
+    const { data: w } = await supabase.from('warehouses').select('id, name').eq('vehicle_id', vehicleId).eq('active', true).maybeSingle()
+    if (!w) return { warehouse: null, lines: [] }
+    const { data, error } = await supabase.from('inventory_items').select('id, code, name, unit, lot, expiry_date, stock, category').eq('warehouse_id', w.id).gt('stock', 0).order('name')
+    if (error) throw error
+    return { warehouse: { id: w.id, name: w.name }, lines: data.map((l) => ({ id: l.id, code: l.code, name: l.name, unit: l.unit, lot: l.lot, expiryDate: l.expiry_date, stock: Number(l.stock), category: l.category, expired: Boolean(l.expiry_date && l.expiry_date < todayBogota()) })) }
+  }
+  app.get('/vehiculos-reportes/:id/dotacion', auth(TRIP_ROLES), hx(async (req, res) => {
+    const t = await loadTrip(req.params.id)
+    res.send({ ...(await ambulanceStock(t.vehicle_id)), canEdit: canEditSupplies(req, t) && supplyWindowOk(t) })
+  }))
+  app.post('/vehiculos-reportes/:id/insumos', auth(TRIP_ROLES), hx(async (req, res) => {
+    const t = await loadTrip(req.params.id)
+    if (!canEditSupplies(req, t)) return fail(res, 'Solo el conductor del reporte o el administrador registra los insumos', 403)
+    if (!supplyWindowOk(t)) return fail(res, 'Los insumos se registran durante la actividad o hasta 48 horas después de cerrarla', 400)
+    const b = req.body || {}
+    const qty = Number(b.quantity)
+    if (!Number.isFinite(qty) || qty <= 0) return fail(res, 'Cantidad inválida', 400)
+    const { warehouse, lines } = await ambulanceStock(t.vehicle_id)
+    if (!warehouse) return fail(res, 'Esta móvil no tiene dotación creada (Inventario → Kits, botiquines y ambulancias)', 400)
+    const line = lines.find((l) => l.id === Number(b.itemId))
+    if (!line) return fail(res, 'Selecciona un insumo de la dotación de la móvil', 400)
+    if (line.expired) return fail(res, `${line.name} (lote ${line.lot}) está vencido`, 400)
+    if (qty > line.stock) return fail(res, `Stock insuficiente de ${line.name}: hay ${line.stock}`, 400)
+    const { data: ref } = await supabase.rpc('inv_next_transfer')
+    const { error } = await supabase.rpc('inv_move', { p_item: line.id, p_delta: -qty, p_type: 'consumo', p_user: req.user.id, p_note: `Consumo en ${t.code}${clean(b.observation) ? ` · ${clean(b.observation)}` : ''}`, p_destination: `ambulancia:${warehouse.id}`, p_event: null, p_ref: ref })
+    if (error) return fail(res, /STOCK|23514/.test(`${error.message}${error.code}`) ? 'Stock insuficiente' : error.message, 400)
+    await supabase.from('inventory_movements').update({ trip_id: t.id }).eq('transfer_ref', ref)
+    const { error: e2 } = await supabase.from('vehicle_trip_supplies').insert({ trip_id: t.id, item_id: line.id, quantity: qty, observation: clean(b.observation), created_by: req.user.id })
+    if (e2) throw e2
+    res.status(201).send(tripDTO(await loadTrip(t.id)))
+  }))
+  app.delete('/vehiculos-reportes/:id/insumos/:sid', auth(TRIP_ROLES), hx(async (req, res) => {
+    const t = await loadTrip(req.params.id)
+    if (!canEditSupplies(req, t) || !supplyWindowOk(t)) return fail(res, 'No se puede anular este consumo', 403)
+    const row = (t.vehicle_trip_supplies || []).find((x) => x.id === Number(req.params.sid))
+    if (!row) return fail(res, 'Registro no encontrado', 404)
+    const { error } = await supabase.rpc('inv_move', { p_item: row.item.id, p_delta: Number(row.quantity), p_type: 'reverso', p_user: req.user.id, p_note: `Anulación de consumo en ${t.code}`, p_destination: null, p_event: null })
+    if (error) throw error
+    await supabase.from('vehicle_trip_supplies').delete().eq('id', row.id)
+    res.send(tripDTO(await loadTrip(t.id)))
+  }))
 }
