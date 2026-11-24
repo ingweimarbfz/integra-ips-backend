@@ -3,6 +3,8 @@
 // Biomédicos, refrigeración (neveras de vacunas), climatización, eléctricos…
 // Ficha técnica, garantía, estado, stock y mantenimientos con responsable.
 // =====================================================================
+const alerts = require('./alerts')
+
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, uploadImage, removeStoredFile, scopeSite, applyScope, canAccessSite, targetSite } = deps
   // El empleado ve los equipos si su sede tiene al menos un servicio de IPS activo.
@@ -297,4 +299,11 @@ module.exports = (app, deps) => {
       thresholds: ALERT
     })
   }))
+
+  // IIPS-022 · Avisos de equipos (campana y burbuja en "Hoja de vida de equipos").
+  alerts.register({
+    key: 'equipos', module: 'equipos', service: 'any', route: '/equipos',
+    run: async (req) => (await loadAll(scopeSite(req))).filter((e) => e.status !== 'dado_de_baja')
+      .flatMap((e) => e.alerts.map((a) => ({ id: `${e.id}:${a.kind}`, level: a.level, title: `${e.code} · ${e.name}`, message: a.message, link: `/equipos/${e.id}`, date: a.date })))
+  })
 }

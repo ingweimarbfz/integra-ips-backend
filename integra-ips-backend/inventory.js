@@ -9,6 +9,8 @@
 // Lo que sale de una bodega de unidad o grupo no regresa a la bodega general.
 // =====================================================================
 const { pageQuery, setTotal } = require('./paging')
+const alerts = require('./alerts')
+
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, STAFF, ISO_DATE, TZ_OFFSET, todayBogota, scopeSite, canAccessSite } = deps
 
@@ -538,4 +540,30 @@ module.exports = (app, deps) => {
       lowStock: perProduct.filter((x) => x.low).sort((a, b) => a.stock / (a.minStock || 1) - b.stock / (b.minStock || 1)).slice(0, 30)
     })
   }))
+
+  // IIPS-022 · Avisos de inventario: lotes vencidos o por vencer y stock bajo.
+  alerts.register({
+    key: 'inventario', module: 'inventario', route: '/socorro/inventario/existencias',
+    run: async (req) => {
+      const site = scopeSite(req)
+      const [whs, lines, prods, carried] = await Promise.all([
+        loadWarehouses(), loadLines({ site }),
+        supabase.from('inventory_products').select('*'),
+        supabase.from('inventory_items').select('warehouse_id, product_id')
+      ])
+      for (const r of [prods, carried]) if (r.error) throw r.error
+      const known = new Set(carried.data.map((r) => `${r.warehouse_id}:${r.product_id}`))
+      const visibleWh = whs.filter((w) => w.active && (!site || w.site_id === site))
+      const out = []
+      for (const l of lines) {
+        const where = l.warehouseName || l.siteName || ''
+        if (l.expired) out.push({ id: `lote${l.id}`, level: 'bad', title: l.product.name, message: `Lote ${l.lot || 's/n'} vencido (${where})`, date: l.expiryDate })
+        else if (l.expiringSoon) out.push({ id: `lote${l.id}`, level: 'warn', title: l.product.name, message: `Lote ${l.lot || 's/n'} vence en ${l.daysToExpiry} día${l.daysToExpiry === 1 ? '' : 's'} (${where})`, date: l.expiryDate })
+      }
+      for (const x of groupByProduct(lines, visibleWh, prods.data, known).filter((y) => y.low)) {
+        out.push({ id: `bajo${x.warehouseId}:${x.product.id}`, level: x.stock === 0 ? 'bad' : 'warn', title: x.product.name, message: `Stock bajo en ${x.warehouseName}: ${x.stock} de mínimo ${x.minStock}` })
+      }
+      return out
+    }
+  })
 }

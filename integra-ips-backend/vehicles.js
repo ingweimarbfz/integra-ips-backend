@@ -5,6 +5,8 @@
 // =====================================================================
 const V = require('./validate')
 
+const alerts = require('./alerts')
+
 module.exports = (app, deps) => {
   const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, scopeSite, applyScope, canAccessSite, targetSite } = deps
 
@@ -727,4 +729,12 @@ module.exports = (app, deps) => {
       recentTrips: req.user.role === 'administrador' ? trips.data.slice(0, 8).map(tripRow) : driverOnly ? trips.data.filter((t) => t.driver_id === req.user.id).slice(0, 8).map(tripRow) : []
     })
   }))
+
+  // IIPS-022 · Avisos de la flota (SOAT, documentos y mantenimientos).
+  alerts.register({
+    key: 'flota', module: 'flota', route: '/socorro/vehiculos/flota',
+    run: async (req) => (await loadFleet(scopeSite(req))).flatMap((v) => v.alerts.map((a) => ({
+      id: `${v.id}:${a.kind}:${a.date || ''}`, level: a.level, title: `Móvil ${v.movil} · ${v.plate}`, message: a.message, link: `/socorro/vehiculos/flota/${v.id}`, date: a.date
+    })))
+  })
 }
