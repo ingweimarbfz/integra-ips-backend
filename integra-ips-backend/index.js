@@ -15,9 +15,9 @@ let legal = null // documentos legales: se registra más abajo
 const LEGAL_ALLOW = ['/auth/me', '/legal', '/firma', '/configuracion', '/plan', '/perfil']
 // El estudiante (portal de Académico ETDH) solo usa su sesión, su perfil, su firma, los documentos legales y su portal.
 // Cualquier otra ruta se le niega aunque el endpoint esté abierto a todos los roles (auth() sin roles).
-const STUDENT_ALLOW = ['/auth/me', '/mis-notificaciones', '/legal', '/firma', '/configuracion', '/perfil', '/academico/mi-programa', '/academico/catalogos', '/academico/mi-asistencia', '/academico/mis-clases', '/academico/mi-aula', '/academico/mis-certificados']
+const STUDENT_ALLOW = ['/auth/me', '/alertas', '/mi-direccion', '/academico/aula-virtual', '/mis-notificaciones', '/legal', '/firma', '/configuracion', '/perfil', '/academico/mi-programa', '/academico/catalogos', '/academico/mi-asistencia', '/academico/mis-clases', '/academico/mi-aula', '/academico/mis-certificados']
 // Docente (Académico ETDH): su panel, sus clases y lo básico de la cuenta.
-const TEACHER_ALLOW = ['/auth/me', '/mis-notificaciones', '/legal', '/firma', '/configuracion', '/perfil', '/academico/docente', '/academico/catalogos', '/academico/mis-clases']
+const TEACHER_ALLOW = ['/auth/me', '/alertas', '/mi-direccion', '/mi-hoja-de-vida', '/academico/aula-virtual', '/mis-notificaciones', '/legal', '/firma', '/configuracion', '/perfil', '/academico/docente', '/academico/catalogos', '/academico/mis-clases']
 const TEACHER_ALLOW_RE = [/^\/academico\/grupos\/\d+\/(aula|notas|evaluaciones|materiales)$/, /^\/academico\/materiales\/\d+(\/entregas)?$/, /^\/academico\/entregas\/\d+\/calificar$/, /^\/academico\/evaluaciones\/\d+$/, /^\/academico\/clases\/\d+$/, /^\/academico\/clases\/\d+\/asistencia(\/[a-z0-9-]+){0,2}$/, /^\/academico\/grupos\/\d+\/asistencia$/]
 // Rutas exactas del portal: su contrato (ver y firmar), sus recibos y el reglamento. Cada endpoint valida que la matrícula sea suya.
 const STUDENT_ALLOW_RE = [/^\/academico\/certificados\/\d+$/, /^\/academico\/materiales\/\d+\/entregar$/, /^\/academico\/matriculas\/\d+\/contrato(\/firmar)?$/, /^\/academico\/matriculas\/\d+\/factura$/, /^\/academico\/pagos\/\d+$/, /^\/academico\/configuracion$/]
