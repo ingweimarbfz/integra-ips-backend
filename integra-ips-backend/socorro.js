@@ -252,8 +252,8 @@ module.exports = (app, deps) => {
   // ================================================================ Eventos
   const EVENT_SELECT = `*, site:sites(id, name, municipality), coordinator:volunteers!gso_events_coordinator_id_fkey(*),
     gso_event_personnel(id, created_at, user_id, counts_hours, role_label, volunteers(*, site:sites(name)), usr:users!gso_event_personnel_user_id_fkey(id, name, last_name, identification, role, remunerado, site:sites(name))),
-    gso_event_materials(id, quantity, returned, state, observation, created_at, inventory_items(*)),
-    gso_event_supplies(id, quantity, observation, created_at, inventory_items(*), users(name, last_name))`
+    gso_event_materials(id, quantity, returned, state, observation, created_at, inventory_items(*, warehouse:warehouses(name, kind)), gso_event_material_units(id, unit_label, state, observation)),
+    gso_event_supplies(id, quantity, observation, created_at, inventory_items(*, warehouse:warehouses(name, kind)), users(name, last_name))`
 
   const isCoordinator = (event, user) => event.coordinator?.document === user.identification
   const canManage = (event, user) => user.role === 'administrador' || isCoordinator(event, user)
@@ -269,7 +269,9 @@ module.exports = (app, deps) => {
           agrupacion: p.role_label || ROLE_NAMES[p.usr.role], siteName: p.usr.site?.name ?? null, countsHours: p.counts_hours, roleLabel: p.role_label || ROLE_NAMES[p.usr.role], remunerado: p.usr.remunerado })),
     materials: (e.gso_event_materials || []).sort((a, b) => a.id - b.id).map((m) => ({
       id: m.id, quantity: Number(m.quantity), returned: m.returned == null ? null : Number(m.returned), state: m.state,
-      observation: m.observation, item: itemDTO(m.inventory_items)
+      observation: m.observation, item: itemDTO(m.inventory_items),
+      // IIPS-024: estado de cada unidad al regresar (p. ej. cuál camilla volvió mala).
+      units: (m.gso_event_material_units || []).sort((a, b) => a.id - b.id).map((u) => ({ id: u.id, label: u.unit_label, state: u.state, observation: u.observation }))
     })),
     supplies: (e.gso_event_supplies || []).sort((a, b) => a.id - b.id).map((s) => ({
       id: s.id, quantity: Number(s.quantity), observation: s.observation, createdAt: s.created_at,
@@ -584,6 +586,13 @@ module.exports = (app, deps) => {
       const qty = r ? num(r.returned) : Number(m.quantity)
       if (Number.isNaN(qty) || qty < 0 || qty > Number(m.quantity)) return fail(res, `Cantidad devuelta inválida para ${m.inventory_items.name}`, 400)
       if (r?.state && !STATES.includes(r.state)) return fail(res, 'Estado inválido', 400)
+      if (r?.units !== undefined) {
+        if (!Array.isArray(r.units) || r.units.length > Number(m.quantity)) return fail(res, `Revisa las unidades de ${m.inventory_items.name}`, 400)
+        for (const u of r.units) {
+          if (!clean(u.label)) return fail(res, `Identifica cada unidad de ${m.inventory_items.name} (número, serial o placa)`, 400)
+          if (!STATES.includes(u.state)) return fail(res, `Estado inválido en ${m.inventory_items.name}`, 400)
+        }
+      }
     }
     let complete = true
     for (const m of event.gso_event_materials) {
@@ -592,9 +601,17 @@ module.exports = (app, deps) => {
       if (qty < Number(m.quantity)) complete = false
       if (qty > 0) await moveStock(m.inventory_items.id, qty, 'devolucion', event.id, req.user.id, `Entrada de ${event.code}`)
       const missing = Number(m.quantity) - qty
+      // Con unidades identificadas, el estado del material es el peor de sus unidades.
+      const WORST = ['bueno', 'regular', 'malo', 'perdido']
+      const units = Array.isArray(r.units) ? r.units.map((u) => ({ material_id: m.id, unit_label: clean(u.label).slice(0, 80), state: u.state, observation: clean(u.observation) })) : null
+      if (units) {
+        await supabase.from('gso_event_material_units').delete().eq('material_id', m.id)
+        if (units.length) { const { error: uErr } = await supabase.from('gso_event_material_units').insert(units); if (uErr) throw uErr }
+      }
+      const unitState = units?.length ? units.map((u) => u.state).sort((a, b) => WORST.indexOf(b) - WORST.indexOf(a))[0] : null
       await supabase.from('gso_event_materials').update({
         returned: qty,
-        state: r.state || (missing > 0 && qty === 0 ? 'perdido' : m.state),
+        state: unitState || r.state || (missing > 0 && qty === 0 ? 'perdido' : m.state),
         observation: r.observation !== undefined ? clean(r.observation) : m.observation
       }).eq('id', m.id)
     }

@@ -60,7 +60,9 @@ module.exports = (app, deps) => {
   }
 
   // ---------------------------------------------------------------- Bodegas (varias por sede; una sola es la general)
-  const WH_SELECT = 'id, code, name, description, responsible, location, is_general, active, site_id, site:sites(id, name, type, municipality, active)'
+  // IIPS-024: kind = bodega | kit | botiquin | ambulancia (dotación de una móvil, vehicle_id).
+  const WH_KINDS = { bodega: 'Bodega', kit: 'Kit biomédico', botiquin: 'Botiquín', ambulancia: 'Ambulancia' }
+  const WH_SELECT = 'id, code, name, description, responsible, location, is_general, active, site_id, kind, vehicle_id, vehicle:vehicles(id, movil, plate, vehicle_type), site:sites(id, name, type, municipality, active)'
   const loadWarehouses = async () => {
     const { data, error } = await supabase.from('warehouses').select(WH_SELECT).order('is_general', { ascending: false }).order('name')
     if (error) throw error
@@ -90,17 +92,24 @@ module.exports = (app, deps) => {
   const siteForView = (req) => scopeSite(req)
   const warehouseDTO = (w) => w && ({
     id: w.id, code: w.code, name: w.name, description: w.description, responsible: w.responsible, location: w.location,
-    isGeneral: w.is_general, active: w.active, siteId: w.site_id, siteName: w.site?.name, siteType: w.site?.type, municipality: w.site?.municipality
+    isGeneral: w.is_general, active: w.active, siteId: w.site_id, siteName: w.site?.name, siteType: w.site?.type, municipality: w.site?.municipality,
+    kind: w.kind || 'bodega', kindLabel: WH_KINDS[w.kind || 'bodega'], vehicleId: w.vehicle_id ?? null, vehicle: w.vehicle ? { id: w.vehicle.id, movil: w.vehicle.movil, plate: w.vehicle.plate, vehicleType: w.vehicle.vehicle_type } : null
   })
 
-  // Destinos de entrega: servicios de IPS habilitados en la sede + Educación + Socorro.
+  // Destinos de entrega: servicios de IPS habilitados en la sede + áreas de Operaciones Generales.
+  // Escalable: cada servicio de IPS nuevo aparece solo como destino.
+  const OPS_DESTS = [
+    { key: 'educacion', label: 'Operaciones Generales · Educación' },
+    { key: 'socorro', label: 'Operaciones Generales · Socorro' },
+    { key: 'flota', label: 'Operaciones Generales · Flota vehicular' },
+    { key: 'administrativo', label: 'Administrativo' }
+  ]
   const destinationsFor = async (siteId) => {
     const { data, error } = await supabase.from('site_services').select('service:ips_services(code, name, active)').eq('site_id', siteId)
     if (error) throw error
     return [
       ...data.map((r) => r.service).filter((x) => x?.active).map((x) => ({ key: `servicio:${x.code}`, label: `IPS · ${x.name}`, group: 'ips' })),
-      { key: 'educacion', label: 'Operaciones Generales · Educación', group: 'operaciones' },
-      { key: 'socorro', label: 'Operaciones Generales · Socorro', group: 'operaciones' }
+      ...OPS_DESTS.map((d) => ({ ...d, group: 'operaciones' }))
     ]
   }
   const destinationLabel = (key, all) => all.find((d) => d.key === key)?.label || key
@@ -266,6 +275,52 @@ module.exports = (app, deps) => {
     }))
   }))
 
+  // ---------------------------------------------------------------- IIPS-024 · Kits, botiquines y dotación de ambulancias
+  // Cada kit es una bodega de la sede (su stock real) con una dotación estándar (lo que debe tener).
+  const loadKits = async (site) => {
+    let q = supabase.from('warehouses').select(WH_SELECT).neq('kind', 'bodega').order('kind').order('name')
+    if (site) q = q.eq('site_id', site)
+    const { data: whs, error } = await q
+    if (error) throw error
+    if (!whs.length) return []
+    const ids = whs.map((w) => w.id)
+    const [lines, cont] = await Promise.all([
+      supabase.from('inventory_items').select(LINE_SELECT).in('warehouse_id', ids).gt('stock', 0),
+      supabase.from('kit_contents').select('warehouse_id, product_id, quantity, product:inventory_products(*)').in('warehouse_id', ids)
+    ])
+    for (const r of [lines, cont]) if (r.error) throw r.error
+    const ls = lines.data.map(lineDTO)
+    return whs.map((w) => {
+      const mine = ls.filter((l) => l.warehouseId === w.id)
+      const dotation = cont.data.filter((c) => c.warehouse_id === w.id).map((c) => {
+        const stock = mine.filter((l) => l.product.id === c.product_id && !l.expired).reduce((a, l) => a + l.stock, 0)
+        return { productId: c.product_id, product: productDTO(c.product), quantity: Number(c.quantity), stock, missing: Math.max(0, Number(c.quantity) - stock) }
+      })
+      const extra = mine.filter((l) => !dotation.some((d) => d.productId === l.product.id))
+      return {
+        ...warehouseDTO(w), dotation, lines: mine, extraLines: extra.length,
+        expired: mine.filter((l) => l.expired).length, expiringSoon: mine.filter((l) => l.expiringSoon).length,
+        complete: dotation.length > 0 && dotation.every((d) => d.missing === 0),
+        missingItems: dotation.filter((d) => d.missing > 0).length
+      }
+    })
+  }
+  app.get('/inventario/kits', auth(STAFF), hx(async (req, res) => res.send(await loadKits(scopeSite(req)))))
+  app.put('/inventario/kits/:id/dotacion', auth(ADMIN), hx(async (req, res) => {
+    const w = await warehouseById(req.params.id)
+    if (!w || (w.kind || 'bodega') === 'bodega') return fail(res, 'Kit no encontrado', 404)
+    const items = (req.body?.items || []).map((x) => ({ product_id: Number(x.productId), quantity: num(x.quantity) })).filter((x) => x.product_id)
+    if (new Set(items.map((x) => x.product_id)).size !== items.length) return fail(res, 'Hay productos repetidos en la dotación', 400)
+    for (const it of items) if (Number.isNaN(it.quantity) || it.quantity <= 0) return fail(res, 'Cada producto de la dotación necesita una cantidad mayor que cero', 400)
+    const { error: e1 } = await supabase.from('kit_contents').delete().eq('warehouse_id', w.id)
+    if (e1) throw e1
+    if (items.length) {
+      const { error } = await supabase.from('kit_contents').insert(items.map((x) => ({ ...x, warehouse_id: w.id })))
+      if (error) throw error
+    }
+    res.send((await loadKits(w.site_id)).find((k) => k.id === w.id))
+  }))
+
   // CRUD de bodegas (solo admin)
   const validateWarehouse = async (b, id) => {
     const e = []
@@ -279,7 +334,17 @@ module.exports = (app, deps) => {
       const { count } = await supabase.from('inventory_items').select('id', { count: 'exact', head: true }).eq('warehouse_id', id).gt('stock', 0)
       if (count) e.push('La bodega tiene existencias; trasládalas o dalas de baja antes de desactivarla')
     }
-    return { errors: e, row: { name: clean(b.name), site_id: Number(b.siteId), description: clean(b.description), responsible: clean(b.responsible), location: clean(b.location), active: b.active !== false, updated_at: new Date().toISOString() } }
+    const kind = WH_KINDS[b.kind] ? b.kind : 'bodega'
+    const vehicleId = kind === 'ambulancia' ? (Number(b.vehicleId) || null) : null
+    if (kind === 'ambulancia' && !vehicleId) e.push('Selecciona la ambulancia (móvil) de esta dotación')
+    if (kind !== 'bodega' && b.isGeneral) e.push('La bodega general no puede ser un kit, botiquín o ambulancia')
+    if (vehicleId) {
+      const { data: v } = await supabase.from('vehicles').select('id, site_id').eq('id', vehicleId).maybeSingle()
+      if (!v) e.push('Ambulancia no encontrada')
+      const { data: other } = await supabase.from('warehouses').select('id').eq('vehicle_id', vehicleId).maybeSingle()
+      if (other && other.id !== id) e.push('Esa ambulancia ya tiene su dotación creada')
+    }
+    return { errors: e, row: { name: clean(b.name), site_id: Number(b.siteId), description: clean(b.description), responsible: clean(b.responsible), location: clean(b.location), active: b.active !== false, kind, vehicle_id: vehicleId, updated_at: new Date().toISOString() } }
   }
   app.post('/inventario/bodegas', auth(ADMIN), hx(async (req, res) => {
     const { errors, row } = await validateWarehouse(req.body || {})
@@ -373,6 +438,11 @@ module.exports = (app, deps) => {
     if (to.is_general) return fail(res, 'Lo entregado a una unidad o grupo no regresa a la bodega general', 400)
     if (!to.active || (to.site && !to.site.active)) return fail(res, 'La bodega de destino o su sede está inactiva', 400)
     if (!from.is_general && from.site_id !== to.site_id) return fail(res, 'Desde una bodega de unidad o grupo solo se traslada a otra bodega de la misma sede', 400)
+    // IIPS-024: área o servicio de la sede al que se carga (IPS, Educación, Socorro…); queda en los movimientos.
+    const tDests = await destinationsFor(to.site_id)
+    const tDest = clean(b.destination)
+    if (tDest && !tDests.some((d) => d.key === tDest)) return fail(res, 'Área o servicio de destino inválido', 400)
+    if (!tDest && (to.kind || 'bodega') === 'bodega') return fail(res, 'Indica a qué área o servicio se carga el traslado', 400)
     const items = (b.items || []).map((x) => ({ itemId: Number(x.itemId), quantity: num(x.quantity) })).filter((x) => x.itemId)
     if (!items.length) return fail(res, 'Agrega al menos un elemento al traslado', 400)
     if (new Set(items.map((x) => x.itemId)).size !== items.length) return fail(res, 'Hay elementos repetidos en el traslado', 400)
@@ -391,6 +461,9 @@ module.exports = (app, deps) => {
       const { error: e } = await supabase.rpc('inv_transfer', { p_item: it.itemId, p_to_warehouse: to.id, p_qty: it.quantity, p_user: req.user.id, p_note: note, p_ref: ref })
       if (e) throw rpcError(e)
     }
+    // Kits y ambulancias: el destino es la propia dotación.
+    const destKey = tDest || `${to.kind}:${to.id}`
+    await supabase.from('inventory_movements').update({ destination: destKey }).eq('transfer_ref', ref)
     res.status(201).send({ ref, toWarehouseId: to.id, warehouseName: to.name, items: items.length })
     deps.notify?.('inventario', async () => deps.notifyMsg().inventario({ title: `TRASLADO ${ref}`, head: [`🏬 ${from.name} → ${to.name}`, `👤 Registró: ${req.user.name} ${req.user.last_name}${note ? ` · 📝 ${note}` : ''}`], lines: deps.notifier().invLines.traslado(await deps.notifier().byRef(ref)) }), to.site_id)
   }))
@@ -455,7 +528,9 @@ module.exports = (app, deps) => {
   })
   const allDestinations = async () => {
     const { data } = await supabase.from('ips_services').select('code, name')
-    return [...(data || []).map((x) => ({ key: `servicio:${x.code}`, label: `IPS · ${x.name}` })), { key: 'educacion', label: 'Operaciones Generales · Educación' }, { key: 'socorro', label: 'Operaciones Generales · Socorro' }]
+    const { data: kits } = await supabase.from('warehouses').select('id, name, kind').neq('kind', 'bodega')
+    return [...(data || []).map((x) => ({ key: `servicio:${x.code}`, label: `IPS · ${x.name}` })), ...OPS_DESTS,
+      ...(kits || []).map((w) => ({ key: `${w.kind}:${w.id}`, label: `${WH_KINDS[w.kind]} · ${w.name}` }))]
   }
 
   app.get('/inventario/movimientos', auth(STAFF), hx(async (req, res) => {
@@ -565,5 +640,14 @@ module.exports = (app, deps) => {
       }
       return out
     }
+  })
+
+  // IIPS-024 · Kits, botiquines y ambulancias con dotación incompleta o insumos vencidos.
+  alerts.register({
+    key: 'kits', module: 'inventario', route: '/socorro/inventario/kits',
+    run: async (req) => (await loadKits(scopeSite(req))).filter((k) => k.active).flatMap((k) => [
+      ...(k.missingItems ? [{ id: `${k.id}:faltantes:${k.dotation.map((d) => d.missing).join('-')}`, level: 'warn', title: `${k.kindLabel} · ${k.name}`, message: `Dotación incompleta: faltan ${k.missingItems} producto${k.missingItems === 1 ? '' : 's'}` }] : []),
+      ...(k.expired ? [{ id: `${k.id}:vencidos:${k.expired}`, level: 'bad', title: `${k.kindLabel} · ${k.name}`, message: `${k.expired} lote${k.expired === 1 ? '' : 's'} vencido${k.expired === 1 ? '' : 's'}` }] : [])
+    ])
   })
 }
