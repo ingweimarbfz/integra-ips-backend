@@ -91,9 +91,7 @@ const ROLE_MODULES = {
 // El plan contratado (plataforma) limita los módulos de todos, incluido el administrador.
 // IIPS-026: el talento humano de otras dependencias viene con el de IPS en el plan.
 const PLAN_ALIAS = { th_general: 'talento_humano' }
-// IIPS-030: la gestión documental no depende del plan.
-const PLAN_FREE = ['correspondencia']
-const inPlan = (m) => !platform.state.modules || PLAN_FREE.includes(m) || platform.state.modules.includes(m) || (PLAN_ALIAS[m] && platform.state.modules.includes(PLAN_ALIAS[m]))
+const inPlan = (m) => !platform.state.modules || platform.state.modules.includes(m) || (PLAN_ALIAS[m] && platform.state.modules.includes(PLAN_ALIAS[m]))
 // Funciones del plan que no son módulos del menú (p. ej. envío de documentos, recordatorios automáticos).
 const hasFeature = (k) => !platform.state.features || platform.state.features.includes(k)
 const userModules = (u) => (u.role === 'administrador' ? MODULE_KEYS : Array.isArray(u.modules) ? u.modules.filter((m) => MODULE_KEYS.includes(m)) : ROLE_MODULES[u.role] || []).filter(inPlan)
