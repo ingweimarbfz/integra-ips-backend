@@ -645,8 +645,7 @@ module.exports = (app, deps) => {
       rulesTitle: edu?.rules_title || 'Reglamento estudiantil', rulesText: edu?.rules_text || null, rulesVersion: edu?.rules_version || '1.0',
       contractClauses: edu?.contract_clauses || null, refundPolicy: edu?.refund_policy || null,
       attendanceFormat: { code: edu?.attendance_format_code || null, name: edu?.attendance_format_name || 'Registro de asistencia', version: edu?.attendance_format_version || null },
-      minAttendancePct: Number(edu?.min_attendance_pct ?? 80), directorUserId: edu?.director_user_id ?? null, passingScore: Number(edu?.passing_score ?? 3),
-      jitsiDomain: edu?.jitsi_domain || 'meet.jit.si'
+      minAttendancePct: Number(edu?.min_attendance_pct ?? 80), directorUserId: edu?.director_user_id ?? null, passingScore: Number(edu?.passing_score ?? 3)
     }
   }
   app.post('/academico/matriculas/:id/pagos', auth(STAFF), hx(async (req, res) => {
@@ -829,7 +828,6 @@ module.exports = (app, deps) => {
     // Formato institucional del acta de asistencia, asistencia mínima y director de educación (firma las actas).
     if (b.attendanceFormat) Object.assign(row, { attendance_format_code: clean(b.attendanceFormat.code)?.slice(0, 30) ?? null, attendance_format_name: clean(b.attendanceFormat.name)?.slice(0, 120) || 'Registro de asistencia', attendance_format_version: clean(b.attendanceFormat.version)?.slice(0, 20) ?? null })
     if ('passingScore' in b) { const p = num(b.passingScore, 3); if (p < 0 || p > 5) return fail(res, 'La nota mínima aprobatoria debe estar entre 0 y 5', 400); row.passing_score = p }
-    if ('jitsiDomain' in b) { const d = String(b.jitsiDomain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''); if (d && !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)) return fail(res, 'Dominio de Jitsi inválido (ej. meet.jit.si)', 400); row.jitsi_domain = d || 'meet.jit.si' }
     if ('minAttendancePct' in b) { const m = num(b.minAttendancePct, 80); if (m < 0 || m > 100) return fail(res, 'La asistencia mínima debe estar entre 0 y 100 %', 400); row.min_attendance_pct = m }
     if ('directorUserId' in b) {
       const id = Number(b.directorUserId) || null
@@ -986,8 +984,7 @@ module.exports = (app, deps) => {
   // ---------------------------------------------------------------- Horarios y clases (fase 3)
   // Un horario (plantilla) genera las clases concretas entre su inicio y su fin en los días elegidos (1 = lunes … 7 = domingo).
   // Cada clase se reprograma, cambia de enlace o se cancela por separado; en la fase 4 lleva la asistencia.
-  // IIPS-028: jitsi = aula virtual integrada (la sala la genera el sistema; no lleva enlace externo).
-  const PLATFORMS = { jitsi: 'Aula virtual integrada', meet: 'Google Meet', teams: 'Microsoft Teams', zoom: 'Zoom', otro: 'Otra plataforma' }
+  const PLATFORMS = { meet: 'Google Meet', teams: 'Microsoft Teams', zoom: 'Zoom', otro: 'Otra plataforma' }
   const WEEKDAYS = ['', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
   const TIME = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/
   const hhmm = (t) => String(t || '').slice(0, 5)
@@ -1055,7 +1052,7 @@ module.exports = (app, deps) => {
     const modality = 'modality' in b ? (['presencial', 'virtual'].includes(b.modality) ? b.modality : null) : current.modality
     if (!modality) e.push('Modalidad inválida')
     const platform = modality === 'virtual' ? ('platform' in b ? (PLATFORMS[b.platform] ? b.platform : null) : current.platform) : null
-    const url = modality === 'virtual' && platform !== 'jitsi' ? ('meetingUrl' in b ? clean(b.meetingUrl) : current.meeting_url) : null
+    const url = modality === 'virtual' ? ('meetingUrl' in b ? clean(b.meetingUrl) : current.meeting_url) : null
     if (modality === 'virtual' && !platform) e.push('Elige la plataforma de la clase virtual')
     if (url && !URL_RE.test(url)) e.push('El enlace de la clase debe empezar por https://')
     const start = 'startTime' in b ? clean(b.startTime) : hhmm(current.start_time)
@@ -2103,56 +2100,6 @@ module.exports = (app, deps) => {
   }))
 
   // IIPS-022 · Avisos del docente: clases dictadas sin cerrar la asistencia y entregas por revisar.
-  // ================================================================ IIPS-028 · Aula virtual integrada (Jitsi)
-  // La sala se genera por clase (nombre difícil de adivinar). El docente y los estudiantes matriculados entran
-  // desde el sistema; queda registro de quién ingresó. El dominio de Jitsi se configura (meet.jit.si o uno propio/JaaS).
-  const roomName = (x) => `Integra${String(x.group?.code || 'G').replace(/[^A-Za-z0-9]/g, '')}Clase${x.id}${require('crypto').createHash('sha256').update(`${x.org_id}:${x.id}:${x.created_at}`).digest('hex').slice(0, 10)}`
-  // JaaS (8x8 Jitsi as a Service, plan Dev gratuito: 25 usuarios activos al mes): con las variables JAAS_APP_ID,
-  // JAAS_KID y JAAS_PRIVATE_KEY el sistema firma un token por persona; el docente entra como moderador y la
-  // llamada embebida no se corta a los 5 minutos. Sin ellas se usa el dominio configurado (meet.jit.si).
-  const jaasConfigured = () => Boolean(process.env.JAAS_APP_ID && process.env.JAAS_KID && process.env.JAAS_PRIVATE_KEY)
-  const jaasToken = (req, moderator, room) => {
-    if (!jaasConfigured()) return null
-    const jwt = require('jsonwebtoken')
-    const appId = process.env.JAAS_APP_ID.trim()
-    const key = process.env.JAAS_PRIVATE_KEY.replace(/\\n/g, '\n')
-    const now = Math.floor(Date.now() / 1000)
-    const token = jwt.sign({
-      aud: 'jitsi', iss: 'chat', sub: appId, room, nbf: now - 10, exp: now + 4 * 3600,
-      context: { user: { id: String(req.user.id), name: `${req.user.name} ${req.user.last_name}`.trim(), email: req.user.email || '', avatar: req.user.avatar_url || '', moderator: moderator ? 'true' : 'false' }, features: { livestreaming: 'false', recording: 'false', transcription: 'false', 'outbound-call': 'false' } }
-    }, key, { algorithm: 'RS256', header: { kid: process.env.JAAS_KID.trim(), typ: 'JWT' } })
-    return { appId, jwt: token }
-  }
-  app.get('/academico/aula-virtual-estado', auth(STAFF), hx(async (req, res) => res.send({ jaas: jaasConfigured(), domain: (await settingsOf()).jitsiDomain })))
-  const canEnterRoom = async (req, x) => {
-    if (STAFF.includes(req.user.role) || x.teacher_user_id === req.user.id) return 'docente'
-    if (req.user.role !== 'estudiante') return null
-    const st = await must(supabase.from('edu_students').select('id').eq('user_id', req.user.id).maybeSingle())
-    if (!st) return null
-    const enr = await must(supabase.from('edu_enrollments').select('id').eq('student_id', st.id).eq('group_id', x.group_id).in('status', ['matriculado', 'aplazado']).limit(1))
-    return enr.length ? 'estudiante' : null
-  }
-  app.get('/academico/aula-virtual/:id', auth([...STAFF, 'docente', 'estudiante']), hx(async (req, res) => {
-    const x = await must(supabase.from('edu_sessions').select(SESSION_SELECT).eq('id', Number(req.params.id)).maybeSingle())
-    if (!x) return fail(res, 'Clase no encontrada', 404)
-    const as = await canEnterRoom(req, x)
-    if (!as) return fail(res, 'No perteneces a este grupo', 403)
-    if (x.modality !== 'virtual' || x.platform !== 'jitsi') return fail(res, 'Esta clase no usa el aula virtual integrada', 400)
-    if (x.status === 'cancelada') return fail(res, 'La clase fue cancelada', 400)
-    const cfg = await settingsOf()
-    const jaas = jaasToken(req, as === 'docente', roomName(x))
-    const joins = as === 'docente' ? await must(supabase.from('edu_virtual_joins').select('user_id, joined_at, user:users(name, last_name, role)').eq('session_id', x.id).order('joined_at')) : []
-    const people = {}
-    for (const j of joins) { const k = j.user_id; people[k] = people[k] || { userId: k, name: `${j.user?.name || ''} ${j.user?.last_name || ''}`.trim(), role: j.user?.role, first: j.joined_at, times: 0 }; people[k].times += 1 }
-    res.send({ session: sessionDTO(x), domain: jaas ? '8x8.vc' : cfg.jitsiDomain, room: jaas ? `${jaas.appId}/${roomName(x)}` : roomName(x), jwt: jaas?.jwt || null, provider: jaas ? 'jaas' : 'jitsi', as, displayName: `${req.user.name} ${req.user.last_name}`.trim(), email: req.user.email || null, joins: Object.values(people) })
-  }))
-  app.post('/academico/aula-virtual/:id/ingreso', auth([...STAFF, 'docente', 'estudiante']), hx(async (req, res) => {
-    const x = await must(supabase.from('edu_sessions').select('id, group_id, teacher_user_id, modality, platform').eq('id', Number(req.params.id)).maybeSingle())
-    if (!x || !(await canEnterRoom(req, x))) return fail(res, 'Sin acceso', 403)
-    await must(supabase.from('edu_virtual_joins').insert({ session_id: x.id, user_id: req.user.id }))
-    res.send({ ok: true })
-  }))
-
   // IIPS-023 · Actas de asistencia que esperan la firma del director de educación.
   alerts.register({
     key: 'edu_actas', route: '/educacion/actas', roles: ['administrador', 'empleado'],
