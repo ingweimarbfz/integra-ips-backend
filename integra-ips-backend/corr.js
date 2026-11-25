@@ -76,11 +76,13 @@ module.exports = (app, deps) => {
 
   // ---------------------------------------------------------------- Catálogos y áreas
   app.get('/correspondencia/catalogos', auth(ANY), hx(async (req, res) => {
-    const [areas, users] = await Promise.all([
+    const [areas, users, members] = await Promise.all([
       must(supabase.from('corr_areas').select('id, name, prefix, active, manager_user_id').order('name')),
-      isReception(req.user) ? must(supabase.from('users').select('id, name, last_name, role').eq('active', true).neq('role', 'estudiante').order('name')) : []
+      isReception(req.user) ? must(supabase.from('users').select('id, name, last_name, role').eq('active', true).neq('role', 'estudiante').order('name')) : [],
+      // IIPS-036: personas de cada área (al radicar solo se ofrecen las del área elegida).
+      supabase.from('corr_area_members').select('area_id, user_id').then((r) => r.data || [])
     ])
-    res.send({ kinds: KINDS, statuses: STATUS, responseTypes: RESPONSE_TYPES, responseDays: RESPONSE_DAYS, next: NEXT, areas: areas.map((a) => ({ id: a.id, name: a.name, prefix: a.prefix, active: a.active, managerUserId: a.manager_user_id })), users: users.map((u) => ({ id: u.id, name: fullName(u), role: u.role })) })
+    res.send({ kinds: KINDS, statuses: STATUS, responseTypes: RESPONSE_TYPES, responseDays: RESPONSE_DAYS, next: NEXT, areas: areas.map((a) => ({ id: a.id, name: a.name, prefix: a.prefix, active: a.active, managerUserId: a.manager_user_id, memberIds: members.filter((m) => m.area_id === a.id).map((m) => m.user_id) })), users: users.map((u) => ({ id: u.id, name: fullName(u), role: u.role })) })
   }))
   app.post('/correspondencia/areas', auth(ADMIN), hx(async (req, res) => {
     const name = clean(req.body?.name); const prefix = clean(req.body?.prefix)?.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6)
@@ -88,6 +90,13 @@ module.exports = (app, deps) => {
     const { data, error } = await supabase.from('corr_areas').insert({ name, prefix, manager_user_id: Number(req.body?.managerUserId) || null }).select('*').single()
     if (error) { if (error.code === '23505') return fail(res, 'Ya existe un área con ese prefijo', 409); throw error }
     res.status(201).send(data)
+  }))
+  app.put('/correspondencia/areas/:id/miembros', auth(ADMIN), hx(async (req, res) => {
+    const id = Number(req.params.id)
+    const ids = [...new Set((req.body?.userIds || []).map(Number).filter(Boolean))]
+    await must(supabase.from('corr_area_members').delete().eq('area_id', id))
+    if (ids.length) await must(supabase.from('corr_area_members').insert(ids.map((u) => ({ area_id: id, user_id: u }))))
+    res.send({ ok: true, memberIds: ids })
   }))
   app.put('/correspondencia/areas/:id', auth(ADMIN), hx(async (req, res) => {
     const b = req.body || {}; const row = {}

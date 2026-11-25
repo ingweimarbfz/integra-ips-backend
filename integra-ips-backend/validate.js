@@ -29,14 +29,15 @@ const plateError = (v) => (plate(v) && !PLATE_RE.test(plate(v)) ? 'La placa debe
 // Sin valor se usa la hora del sistema. Con valor ("YYYY-MM-DDTHH:mm", hora de Colombia, o ISO con zona) debe ser
 // pasada (5 min de tolerancia), no más de MANUAL_MAX_DAYS atrás y, si se da, posterior a "after".
 const MANUAL_MAX_DAYS = 30
-const manualTime = (value, { after, label = 'La fecha y hora' } = {}) => {
+// allowFutureDays: permite una hora futura (p. ej. la planilla de un evento programado se llena antes de empezar).
+const manualTime = (value, { after, label = 'La fecha y hora', allowFutureDays = 0 } = {}) => {
   if (value === undefined || value === null || value === '') return { iso: new Date().toISOString(), manual: false }
   const str = String(value).trim()
   const withZone = /[zZ]|[+-]\d{2}:?\d{2}$/.test(str) ? str : `${str.length === 16 ? `${str}:00` : str}-05:00`
   const d = new Date(withZone)
   if (Number.isNaN(d.getTime())) return { error: `${label} no es válida` }
   const now = Date.now()
-  if (d.getTime() > now + 5 * 60000) return { error: `${label} no puede ser futura` }
+  if (d.getTime() > now + 5 * 60000 + allowFutureDays * 86400000) return { error: allowFutureDays ? `${label} no puede ser de más de ${allowFutureDays} días adelante` : `${label} no puede ser futura` }
   if (d.getTime() < now - MANUAL_MAX_DAYS * 86400000) return { error: `${label} no puede ser de hace más de ${MANUAL_MAX_DAYS} días` }
   if (after && d.getTime() < new Date(after).getTime()) return { error: `${label} no puede ser anterior al inicio` }
   return { iso: d.toISOString(), manual: true }

@@ -560,6 +560,9 @@ module.exports = (app, deps) => {
     const t = await loadTrip(req.params.id)
     if (!canSeeTrip(t, req.user)) return fail(res, 'Solo el conductor del reporte o un administrador puede cerrarlo', 403)
     if (t.status !== 'abierto') return fail(res, 'El reporte ya está cerrado', 400)
+    // IIPS-036: lo cierra el conductor (km, tacómetro y tanqueo). El administrador solo en una excepción, con motivo.
+    const adminClose = req.user.role === 'administrador' && t.driver_id !== req.user.id
+    if (adminClose && !clean(req.body?.adminReason)) return fail(res, 'El cierre lo hace el conductor. Para cerrarlo como administrador indica el motivo (p. ej. el conductor no tiene acceso)', 400)
     // Si la actividad está asociada a un servicio de Socorro, solo se cierra cuando ese servicio ya finalizó.
     if (t.event_id) {
       const { data: ev } = await supabase.from('gso_events').select('code, name, status').eq('id', t.event_id).maybeSingle()
@@ -584,7 +587,7 @@ module.exports = (app, deps) => {
     const { error } = await supabase.from('vehicle_trips').update({
       status: 'cerrado', ended_at: end.iso, km_in: kmIn, tachometer_photo: tach,
       fuel_value: fuel || null, fuel_gallons: fuel ? gallons : null, fuel_ticket_photo: ticket,
-      observation: b.observation !== undefined ? clean(b.observation) : t.observation, updated_at: new Date().toISOString()
+      observation: [b.observation !== undefined ? clean(b.observation) : t.observation, adminClose ? `Cerrado por administración (${req.user.name} ${req.user.last_name}): ${clean(req.body.adminReason)}` : null].filter(Boolean).join(' · ') || null, updated_at: new Date().toISOString()
     }).eq('id', t.id)
     if (error) throw error
     // El km de llegada pasa a ser el km actual del vehículo.

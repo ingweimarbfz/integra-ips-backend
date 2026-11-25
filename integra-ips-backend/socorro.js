@@ -350,7 +350,7 @@ module.exports = (app, deps) => {
     const busy = await activeEventOf(coordinatorId)
     if (busy) return fail(res, busyMessage(coord, busy), 409)
     // Hora de inicio: la del sistema o la que se indique (el servicio pudo empezar antes de registrarlo).
-    const start = V.manualTime(b.startedAt, { label: 'La fecha y hora de inicio' })
+    const start = V.manualTime(b.startedAt, { label: 'La fecha y hora de inicio', allowFutureDays: 30 })
     if (start.error) return fail(res, start.error, 400)
     const { data, error } = await supabase.from('gso_events').insert({
       name: clean(b.name), place: clean(b.place), area: AREAS.includes(b.area) ? b.area : 'socorro', coordinator_id: coordinatorId, created_by: req.user.id, site_id: siteId,

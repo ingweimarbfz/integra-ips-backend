@@ -314,7 +314,7 @@ module.exports = (app, deps) => {
 
   // IIPS-023 · Documentos por firmar en la campana y en "Mi firma digital" (los del director, como pendientes por atender).
   alerts.register({
-    key: 'firmas', route: '/firma',
+    key: 'firmas', route: '/firmas-pendientes',
     run: async (req) => (await pendingFor(req.user)).slice(0, 120).map((x) => ({
       id: `${x.docType}:${x.docKey}:${x.slot}`, level: x.asDirector ? 'warn' : 'info', title: x.title, message: `Por firmar: ${x.slotLabel || x.slot}${x.subtitle ? ` · ${x.subtitle}` : ''}`, link: x.link, date: x.date ? String(x.date).slice(0, 10) : undefined
     }))

@@ -62,7 +62,7 @@ module.exports = (app, deps) => {
   // ---------------------------------------------------------------- Bodegas (varias por sede; una sola es la general)
   // IIPS-024: kind = bodega | kit | botiquin | ambulancia (dotación de una móvil, vehicle_id).
   const WH_KINDS = { bodega: 'Bodega', kit: 'Kit biomédico', botiquin: 'Botiquín', ambulancia: 'Ambulancia' }
-  const WH_SELECT = 'id, code, name, description, responsible, location, is_general, active, site_id, kind, vehicle_id, vehicle:vehicles(id, movil, plate, vehicle_type), site:sites(id, name, type, municipality, active)'
+  const WH_SELECT = 'id, code, name, description, responsible, responsible_user_id, compartments, location, is_general, active, site_id, kind, vehicle_id, vehicle:vehicles(id, movil, plate, vehicle_type), site:sites(id, name, type, municipality, active)'
   const loadWarehouses = async () => {
     const { data, error } = await supabase.from('warehouses').select(WH_SELECT).order('is_general', { ascending: false }).order('name')
     if (error) throw error
@@ -93,7 +93,7 @@ module.exports = (app, deps) => {
   const warehouseDTO = (w) => w && ({
     id: w.id, code: w.code, name: w.name, description: w.description, responsible: w.responsible, location: w.location,
     isGeneral: w.is_general, active: w.active, siteId: w.site_id, siteName: w.site?.name, siteType: w.site?.type, municipality: w.site?.municipality,
-    kind: w.kind || 'bodega', kindLabel: WH_KINDS[w.kind || 'bodega'], vehicleId: w.vehicle_id ?? null, vehicle: w.vehicle ? { id: w.vehicle.id, movil: w.vehicle.movil, plate: w.vehicle.plate, vehicleType: w.vehicle.vehicle_type } : null
+    kind: w.kind || 'bodega', kindLabel: WH_KINDS[w.kind || 'bodega'], vehicleId: w.vehicle_id ?? null, responsibleUserId: w.responsible_user_id ?? null, vehicle: w.vehicle ? { id: w.vehicle.id, movil: w.vehicle.movil, plate: w.vehicle.plate, vehicleType: w.vehicle.vehicle_type } : null
   })
 
   // Destinos de entrega: servicios de IPS habilitados en la sede + áreas de Operaciones Generales.
@@ -277,48 +277,121 @@ module.exports = (app, deps) => {
 
   // ---------------------------------------------------------------- IIPS-024 · Kits, botiquines y dotación de ambulancias
   // Cada kit es una bodega de la sede (su stock real) con una dotación estándar (lo que debe tener).
-  const loadKits = async (site) => {
+  // IIPS-036 · Compartimientos sugeridos (la entidad los ajusta). Basados en la dotación de ambulancias de la
+  // Resolución 3100 de 2019 (traslado asistencial básico y medicalizado) y en botiquines de primeros auxilios.
+  const COMPARTMENTS = {
+    TAB: ['Cabina: equipos fijos (camilla, silla, oxígeno central)', 'Vía aérea y oxigenoterapia', 'Circulación y control de hemorragias', 'Inmovilización y trauma', 'Medicamentos y soluciones', 'Bioseguridad y aseo', 'Maletín de primer respondiente', 'Comunicaciones y señalización'],
+    TAM: ['Cabina: equipos fijos (camilla, silla, oxígeno central)', 'Vía aérea avanzada y oxigenoterapia', 'Monitoreo y desfibrilación', 'Ventilación mecánica e infusión', 'Circulación y accesos venosos', 'Inmovilización y trauma', 'Medicamentos de soporte vital avanzado', 'Pediatría y neonatos', 'Bioseguridad y aseo', 'Maletín de primer respondiente', 'Comunicaciones y señalización'],
+    botiquin: ['Curación y heridas', 'Inmovilización', 'Medicamentos de uso general', 'Valoración (signos vitales)', 'Bioseguridad'],
+    kit: ['Equipos', 'Accesorios y consumibles']
+  }
+  const ambType = (w) => { const m = /\b(TAB|TAM)\b/i.exec(w.vehicle?.vehicle_type || ''); return m ? m[1].toUpperCase() : 'TAB' }
+  const defaultCompartments = (w) => (w.kind === 'ambulancia' ? COMPARTMENTS[ambType(w)] : COMPARTMENTS[w.kind] || ['General'])
+  const compartmentsOf = (w) => (Array.isArray(w.compartments) && w.compartments.length ? w.compartments : defaultCompartments(w))
+
+  // Cada kit, botiquín o dotación es una bodega pequeña: su stock es lo que tiene y la dotación, lo que debe tener.
+  const loadKits = async (site, { includeInactive = false } = {}) => {
     let q = supabase.from('warehouses').select(WH_SELECT).neq('kind', 'bodega').order('kind').order('name')
     if (site) q = q.eq('site_id', site)
+    if (!includeInactive) q = q.eq('active', true)
     const { data: whs, error } = await q
     if (error) throw error
     if (!whs.length) return []
     const ids = whs.map((w) => w.id)
     const [lines, cont] = await Promise.all([
       supabase.from('inventory_items').select(LINE_SELECT).in('warehouse_id', ids).gt('stock', 0),
-      supabase.from('kit_contents').select('warehouse_id, product_id, quantity, product:inventory_products(*)').in('warehouse_id', ids)
+      supabase.from('kit_contents').select('warehouse_id, product_id, quantity, compartment, product:inventory_products(*)').in('warehouse_id', ids)
     ])
     for (const r of [lines, cont]) if (r.error) throw r.error
     const ls = lines.data.map(lineDTO)
     return whs.map((w) => {
       const mine = ls.filter((l) => l.warehouseId === w.id)
+      const comps = compartmentsOf(w)
       const dotation = cont.data.filter((c) => c.warehouse_id === w.id).map((c) => {
         const stock = mine.filter((l) => l.product.id === c.product_id && !l.expired).reduce((a, l) => a + l.stock, 0)
-        return { productId: c.product_id, product: productDTO(c.product), quantity: Number(c.quantity), stock, missing: Math.max(0, Number(c.quantity) - stock) }
+        return { productId: c.product_id, product: productDTO(c.product), quantity: Number(c.quantity), compartment: c.compartment || comps[0], stock, missing: Math.max(0, Number(c.quantity) - stock) }
       })
-      const extra = mine.filter((l) => !dotation.some((d) => d.productId === l.product.id))
+      // Lo que el kit tiene y no está en su dotación (se puede agregar a la dotación con un clic).
+      const outside = Object.values(mine.filter((l) => !dotation.some((d) => d.productId === l.product.id)).reduce((a, l) => {
+        a[l.product.id] = a[l.product.id] || { productId: l.product.id, product: l.product, stock: 0, lots: [] }
+        a[l.product.id].stock += l.stock; if (l.lot) a[l.product.id].lots.push(l.lot); return a
+      }, {}))
       return {
-        ...warehouseDTO(w), dotation, lines: mine, extraLines: extra.length,
+        ...warehouseDTO(w), compartments: comps, ambulanceType: w.kind === 'ambulancia' ? ambType(w) : null,
+        dotation, outside, lines: mine, extraLines: outside.length,
         expired: mine.filter((l) => l.expired).length, expiringSoon: mine.filter((l) => l.expiringSoon).length,
         complete: dotation.length > 0 && dotation.every((d) => d.missing === 0),
         missingItems: dotation.filter((d) => d.missing > 0).length
       }
     })
   }
-  app.get('/inventario/kits', auth(STAFF), hx(async (req, res) => res.send(await loadKits(scopeSite(req)))))
+  const kitById = async (id) => {
+    const w = await warehouseById(id)
+    if (!w || (w.kind || 'bodega') === 'bodega') throw httpError(404, 'Kit no encontrado')
+    return w
+  }
+  app.get('/inventario/kits', auth(STAFF), hx(async (req, res) => res.send(await loadKits(scopeSite(req), { includeInactive: req.query.inactivos === '1' }))))
+  app.get('/inventario/kits/compartimientos', auth(STAFF), hx(async (req, res) => res.send(COMPARTMENTS)))
+  // Dotación (lo que debe tener, por compartimiento) y la lista de compartimientos del kit.
   app.put('/inventario/kits/:id/dotacion', auth(ADMIN), hx(async (req, res) => {
-    const w = await warehouseById(req.params.id)
-    if (!w || (w.kind || 'bodega') === 'bodega') return fail(res, 'Kit no encontrado', 404)
-    const items = (req.body?.items || []).map((x) => ({ product_id: Number(x.productId), quantity: num(x.quantity) })).filter((x) => x.product_id)
+    const w = await kitById(req.params.id)
+    const comps = Array.isArray(req.body?.compartments) ? [...new Set(req.body.compartments.map((c) => clean(c)).filter(Boolean))].slice(0, 20) : compartmentsOf(w)
+    const items = (req.body?.items || []).map((x) => ({ product_id: Number(x.productId), quantity: num(x.quantity), compartment: clean(x.compartment) || comps[0] || null })).filter((x) => x.product_id)
     if (new Set(items.map((x) => x.product_id)).size !== items.length) return fail(res, 'Hay productos repetidos en la dotación', 400)
     for (const it of items) if (Number.isNaN(it.quantity) || it.quantity <= 0) return fail(res, 'Cada producto de la dotación necesita una cantidad mayor que cero', 400)
+    if (Array.isArray(req.body?.compartments)) { const { error } = await supabase.from('warehouses').update({ compartments: comps, updated_at: new Date().toISOString() }).eq('id', w.id); if (error) throw error }
     const { error: e1 } = await supabase.from('kit_contents').delete().eq('warehouse_id', w.id)
     if (e1) throw e1
     if (items.length) {
       const { error } = await supabase.from('kit_contents').insert(items.map((x) => ({ ...x, warehouse_id: w.id })))
       if (error) throw error
     }
-    res.send((await loadKits(w.site_id)).find((k) => k.id === w.id))
+    res.send((await loadKits(w.site_id, { includeInactive: true })).find((k) => k.id === w.id))
+  }))
+  // Reponer faltantes: toma de la bodega elegida (lotes que vencen primero) lo que le falta a la dotación.
+  app.post('/inventario/kits/:id/reponer', auth(ADMIN), hx(async (req, res) => {
+    const w = await kitById(req.params.id)
+    const from = await warehouseById(req.body?.fromWarehouseId)
+    if (!from || !from.active) return fail(res, 'Elige la bodega de donde sale la reposición', 400)
+    if (!from.is_general && from.site_id !== w.site_id) return fail(res, 'La bodega de origen debe ser la general o una de la misma sede', 400)
+    const kit = (await loadKits(w.site_id, { includeInactive: true })).find((k) => k.id === w.id)
+    const missing = kit.dotation.filter((d) => d.missing > 0)
+    if (!missing.length) return res.send({ moved: [], short: [], kit })
+    const { data: src, error } = await supabase.from('inventory_items').select('id, product_id, stock, lot, expiry_date, name').eq('warehouse_id', from.id).in('product_id', missing.map((m) => m.productId)).gt('stock', 0).order('expiry_date', { ascending: true, nullsFirst: false })
+    if (error) throw error
+    const { data: ref } = await supabase.rpc('inv_next_transfer')
+    const moved = []; const short = []
+    for (const m of missing) {
+      let need = m.missing
+      for (const l of src.filter((x) => x.product_id === m.productId && !(x.expiry_date && daysUntil(x.expiry_date) < 0))) {
+        if (need <= 0) break
+        const qty = Math.min(need, Number(l.stock))
+        const { error: e } = await supabase.rpc('inv_transfer', { p_item: l.id, p_to_warehouse: w.id, p_qty: qty, p_user: req.user.id, p_note: `Reposición de ${w.name}`, p_ref: ref })
+        if (e) throw rpcError(e)
+        need -= qty; moved.push({ name: m.product.name, lot: l.lot, quantity: qty })
+      }
+      if (need > 0) short.push({ name: m.product.name, quantity: need })
+    }
+    await supabase.from('inventory_movements').update({ destination: `${w.kind}:${w.id}` }).eq('transfer_ref', ref)
+    res.send({ ref, moved, short, kit: (await loadKits(w.site_id, { includeInactive: true })).find((k) => k.id === w.id) })
+  }))
+  // Desarmar: devuelve todo su contenido a una bodega de la sede (o a la general) y lo desactiva. El inventario no se pierde.
+  app.post('/inventario/kits/:id/desarmar', auth(ADMIN), hx(async (req, res) => {
+    const w = await kitById(req.params.id)
+    const to = await warehouseById(req.body?.toWarehouseId)
+    if (!to || !to.active || (to.kind || 'bodega') !== 'bodega') return fail(res, 'Elige la bodega que recibe el contenido', 400)
+    if (!to.is_general && to.site_id !== w.site_id) return fail(res, 'La bodega que recibe debe ser la general o una de la misma sede', 400)
+    const { data: lines, error } = await supabase.from('inventory_items').select('id, stock').eq('warehouse_id', w.id).gt('stock', 0)
+    if (error) throw error
+    const { data: ref } = lines.length ? await supabase.rpc('inv_next_transfer') : { data: null }
+    for (const l of lines) {
+      const { error: e } = await supabase.rpc('inv_transfer', { p_item: l.id, p_to_warehouse: to.id, p_qty: Number(l.stock), p_user: req.user.id, p_note: `Desarme de ${w.name}`, p_ref: ref })
+      if (e) throw rpcError(e)
+    }
+    // Sin movimientos se elimina; con historial queda inactivo para conservar la trazabilidad.
+    const { count } = await supabase.from('inventory_items').select('id', { count: 'exact', head: true }).eq('warehouse_id', w.id)
+    if (!count) { await supabase.from('kit_contents').delete().eq('warehouse_id', w.id); await supabase.from('warehouses').delete().eq('id', w.id) } else await supabase.from('warehouses').update({ active: false, vehicle_id: null, updated_at: new Date().toISOString() }).eq('id', w.id)
+    res.send({ returned: lines.length, deleted: !count, ref })
   }))
 
   // CRUD de bodegas (solo admin)
@@ -344,7 +417,10 @@ module.exports = (app, deps) => {
       const { data: other } = await supabase.from('warehouses').select('id').eq('vehicle_id', vehicleId).maybeSingle()
       if (other && other.id !== id) e.push('Esa ambulancia ya tiene su dotación creada')
     }
-    return { errors: e, row: { name: clean(b.name), site_id: Number(b.siteId), description: clean(b.description), responsible: clean(b.responsible), location: clean(b.location), active: b.active !== false, kind, vehicle_id: vehicleId, updated_at: new Date().toISOString() } }
+    // IIPS-036: el responsable se elige de los usuarios (se guarda también su nombre para los formatos).
+    let responsible = clean(b.responsible); const responsibleUserId = Number(b.responsibleUserId) || null
+    if (responsibleUserId) { const { data: u } = await supabase.from('users').select('name, last_name').eq('id', responsibleUserId).maybeSingle(); if (!u) e.push('Responsable inválido'); else responsible = `${u.name} ${u.last_name}`.trim() }
+    return { errors: e, row: { name: clean(b.name), site_id: Number(b.siteId), description: clean(b.description), responsible, responsible_user_id: responsibleUserId, location: clean(b.location), active: b.active !== false, kind, vehicle_id: vehicleId, updated_at: new Date().toISOString() } }
   }
   app.post('/inventario/bodegas', auth(ADMIN), hx(async (req, res) => {
     const { errors, row } = await validateWarehouse(req.body || {})
