@@ -390,7 +390,7 @@ module.exports = (app, deps) => {
     }
     // Sin movimientos se elimina; con historial queda inactivo para conservar la trazabilidad.
     const { count } = await supabase.from('inventory_items').select('id', { count: 'exact', head: true }).eq('warehouse_id', w.id)
-    if (!count) { await supabase.from('kit_contents').delete().eq('warehouse_id', w.id); await supabase.from('warehouses').delete().eq('id', w.id) } else await supabase.from('warehouses').update({ active: false, vehicle_id: null, updated_at: new Date().toISOString() }).eq('id', w.id)
+    if (!count) { await supabase.from('kit_contents').delete().eq('warehouse_id', w.id); await supabase.from('warehouses').delete().eq('id', w.id) } else await supabase.from('warehouses').update({ active: false, vehicle_id: null, name: `${w.name} (desarmado ${todayBogota()})`.slice(0, 120), updated_at: new Date().toISOString() }).eq('id', w.id)
     res.send({ returned: lines.length, deleted: !count, ref })
   }))
 
