@@ -660,6 +660,118 @@ module.exports = (app, deps) => {
     res.send(data)
   }))
 
+  // ================================================================ IIPS-036 · Solicitudes de vacaciones
+  // El empleado solicita dentro de su saldo disponible; talento humano aprueba, rechaza o reprograma.
+  const myStaff = async (user) => {
+    let { data: s } = await supabase.from('th_staff').select(STAFF_SELECT).eq('user_id', user.id).maybeSingle()
+    if (!s && user.identification) s = (await supabase.from('th_staff').select(STAFF_SELECT).eq('document', String(user.identification).replace(/\s+/g, '')).maybeSingle()).data
+    return s
+  }
+  const REQ_STATUS = { pendiente: 'Pendiente', aprobada: 'Aprobada', rechazada: 'Rechazada', reprogramada: 'Reprogramada y aprobada', cancelada: 'Cancelada' }
+  const reqDTO2 = (r) => ({ id: r.id, staffId: r.staff_id, staffName: r.staff ? `${r.staff.first_name} ${r.staff.last_name}` : null, positionName: r.staff?.position?.name ?? null, dependencyId: r.staff?.dependency_id ?? null,
+    startDate: r.start_date, endDate: r.end_date, businessDays: Number(r.business_days), status: r.status, statusLabel: REQ_STATUS[r.status], notes: r.notes, responseNote: r.response_note,
+    decidedBy: r.decider ? `${r.decider.name} ${r.decider.last_name}` : null, decidedAt: r.decided_at, createdAt: r.created_at })
+  const REQ_SELECT = '*, staff:th_staff(first_name, last_name, dependency_id, site_id, position:th_positions(name)), decider:users!th_vacation_requests_decided_by_fkey(name, last_name)'
+  const pendingDays = async (staffId, exceptId) => {
+    let q = supabase.from('th_vacation_requests').select('id, business_days').eq('staff_id', staffId).eq('status', 'pendiente')
+    const { data } = await q
+    return (data || []).filter((r) => r.id !== exceptId).reduce((a, r) => a + Number(r.business_days), 0)
+  }
+  app.get('/mis-vacaciones/solicitudes', auth(), hx(async (req, res) => {
+    const s = await myStaff(req.user)
+    if (!s) return res.send([])
+    const { data, error } = await supabase.from('th_vacation_requests').select(REQ_SELECT).eq('staff_id', s.id).order('created_at', { ascending: false }).limit(50)
+    if (error) throw error
+    res.send(data.map(reqDTO2))
+  }))
+  app.get('/mis-vacaciones/calcular', auth(), hx(async (req, res) => {
+    const start = dateOrNull(req.query.inicio); const n = Number(req.query.dias)
+    if (!start || !(n > 0)) return fail(res, 'Datos inválidos', 400)
+    res.send(vacationEnd(start, n))
+  }))
+  app.post('/mis-vacaciones/solicitudes', auth(), hx(async (req, res) => {
+    const s = await myStaff(req.user)
+    if (!s) return fail(res, 'No tienes una hoja de vida registrada en talento humano', 400)
+    const start = dateOrNull(req.body?.startDate); const n = Number(req.body?.businessDays)
+    if (!start) return fail(res, 'Indica desde cuándo', 400)
+    if (start < todayBogota()) return fail(res, 'La fecha de inicio no puede ser pasada', 400)
+    if (!Number.isFinite(n) || n <= 0) return fail(res, 'Indica cuántos días hábiles', 400)
+    const { contracts, taken } = await vacationsFor([s.id])
+    const v = vacationStatus(s, contracts, taken)
+    if (!v.applies) return fail(res, v.reason, 400)
+    const available = Math.floor((v.balance - await pendingDays(s.id)) * 10) / 10
+    if (n > available) return fail(res, `Solo tienes ${Math.max(0, available)} día(s) hábiles disponibles (descontando solicitudes pendientes)`, 400)
+    const { end } = vacationEnd(start, n)
+    const { data, error } = await supabase.from('th_vacation_requests').insert({ staff_id: s.id, start_date: start, end_date: end, business_days: n, notes: clean(req.body?.notes), requested_by: req.user.id }).select(REQ_SELECT).single()
+    if (error) throw error
+    res.status(201).send(reqDTO2(data))
+  }))
+  app.post('/mis-vacaciones/solicitudes/:id/cancelar', auth(), hx(async (req, res) => {
+    const s = await myStaff(req.user)
+    const { data: r } = await supabase.from('th_vacation_requests').select('id, staff_id, status').eq('id', Number(req.params.id)).maybeSingle()
+    if (!s || !r || r.staff_id !== s.id) return fail(res, 'Solicitud no encontrada', 404)
+    if (r.status !== 'pendiente') return fail(res, 'Solo se cancelan las solicitudes pendientes', 400)
+    await supabase.from('th_vacation_requests').update({ status: 'cancelada' }).eq('id', r.id)
+    res.send({ ok: true })
+  }))
+  // Talento humano: bandeja de solicitudes.
+  app.get('/estandares/th/vacaciones/solicitudes', auth(STAFF), hx(async (req, res) => {
+    let q = supabase.from('th_vacation_requests').select(REQ_SELECT).order('created_at', { ascending: false }).limit(200)
+    if (req.query.estado && REQ_STATUS[req.query.estado]) q = q.eq('status', req.query.estado)
+    const { data, error } = await q
+    if (error) throw error
+    const scope = scopeOf(req); const site = scopeSite(req)
+    res.send(data.filter((r) => (scope === 'todos' || (scope === 'ips' ? !r.staff?.dependency_id : Boolean(r.staff?.dependency_id))) && (!site || r.staff?.site_id === site)).map(reqDTO2))
+  }))
+  app.post('/estandares/th/vacaciones/solicitudes/:id/decidir', auth(STAFF), hx(async (req, res) => {
+    const { data: r } = await supabase.from('th_vacation_requests').select('*').eq('id', Number(req.params.id)).maybeSingle()
+    if (!r) return fail(res, 'Solicitud no encontrada', 404)
+    if (r.status !== 'pendiente') return fail(res, 'La solicitud ya fue respondida', 400)
+    const action = req.body?.action
+    const note = clean(req.body?.note)
+    if (action === 'rechazar') {
+      if (!note) return fail(res, 'Indica el motivo del rechazo', 400)
+      await supabase.from('th_vacation_requests').update({ status: 'rechazada', response_note: note, decided_by: req.user.id, decided_at: new Date().toISOString() }).eq('id', r.id)
+      return res.send({ ok: true })
+    }
+    if (!['aprobar', 'reprogramar'].includes(action)) return fail(res, 'Acción inválida', 400)
+    let start = r.start_date; let n = Number(r.business_days)
+    if (action === 'reprogramar') {
+      start = dateOrNull(req.body?.startDate) || start; n = Number(req.body?.businessDays) || n
+      if (!note) return fail(res, 'Indica por qué se reprograma', 400)
+    }
+    const { data: staff } = await supabase.from('th_staff').select(STAFF_SELECT).eq('id', r.staff_id).maybeSingle()
+    const { contracts, taken } = await vacationsFor([r.staff_id])
+    const v = vacationStatus(staff, contracts, taken)
+    const available = v.applies ? v.balance - await pendingDays(r.staff_id, r.id) : 0
+    if (n > available) return fail(res, `La persona solo tiene ${Math.floor(available * 10) / 10} día(s) disponibles`, 400)
+    const { end } = vacationEnd(start, n)
+    const { data: vac, error } = await supabase.from('th_vacations').insert({ staff_id: r.staff_id, start_date: start, end_date: end, business_days: n, kind: 'disfrute', notes: `Solicitud aprobada${note ? ` · ${note}` : ''}`, created_by: req.user.id }).select('id').single()
+    if (error) throw error
+    await supabase.from('th_vacation_requests').update({ status: action === 'aprobar' ? 'aprobada' : 'reprogramada', start_date: start, end_date: end, business_days: n, response_note: note, decided_by: req.user.id, decided_at: new Date().toISOString(), vacation_id: vac.id }).eq('id', r.id)
+    res.send({ ok: true })
+  }))
+  // Avisos: talento humano ve las solicitudes pendientes; el empleado, la respuesta a las suyas (7 días).
+  for (const [key, module, scope, route] of [['vac_solicitudes', 'talento_humano', 'ips', '/estandares/talento-humano/vacaciones'], ['vac_solicitudes_general', 'th_general', 'general', '/talento-humano/vacaciones']]) {
+    alerts.register({
+      key, module, route, roles: ['administrador', 'empleado'],
+      run: async (req) => {
+        const { data } = await supabase.from('th_vacation_requests').select(REQ_SELECT).eq('status', 'pendiente').limit(100)
+        return (data || []).filter((r) => (scope === 'ips' ? !r.staff?.dependency_id : Boolean(r.staff?.dependency_id))).map((r) => ({ id: r.id, level: 'warn', title: `${r.staff.first_name} ${r.staff.last_name}`, message: `Solicita ${Number(r.business_days)} día(s) de vacaciones desde el ${r.start_date.split('-').reverse().join('/')}`, date: r.start_date }))
+      }
+    })
+  }
+  alerts.register({
+    key: 'mis_vacaciones', route: '/mi-hoja-de-vida',
+    run: async (req) => {
+      const s = await myStaff(req.user)
+      if (!s) return []
+      const since = new Date(Date.now() - 7 * 86400000).toISOString()
+      const { data } = await supabase.from('th_vacation_requests').select('id, status, start_date, business_days, response_note').eq('staff_id', s.id).neq('status', 'pendiente').neq('status', 'cancelada').gte('decided_at', since)
+      return (data || []).map((r) => ({ id: `${r.id}:${r.status}`, level: r.status === 'rechazada' ? 'warn' : 'info', title: 'Tu solicitud de vacaciones', message: `${REQ_STATUS[r.status]}: ${Number(r.business_days)} día(s) desde el ${r.start_date.split('-').reverse().join('/')}${r.response_note ? ` · ${r.response_note}` : ''}` }))
+    }
+  })
+
   // ---------------------------------------------------------------- Mi hoja de vida (dashboard de cada usuario)
   app.get('/mi-hoja-de-vida', auth(), hx(async (req, res) => {
     let { data: s } = await supabase.from('th_staff').select(STAFF_SELECT).eq('user_id', req.user.id).maybeSingle()
