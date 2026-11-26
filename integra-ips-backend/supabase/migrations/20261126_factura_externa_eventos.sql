@@ -5,4 +5,6 @@ alter table public.planned_events add column if not exists charge_id bigint refe
 alter table public.planned_events add column if not exists invoice_number text;
 alter table public.planned_events add column if not exists invoiced_at timestamptz;
 create unique index if not exists planned_events_charge_uidx on public.planned_events (charge_id) where charge_id is not null;
+-- Educación sin Facturación: cada pago o abono lleva el N° de la factura del sistema externo.
+alter table public.edu_payments add column if not exists external_invoice text;
 notify pgrst, 'reload schema';

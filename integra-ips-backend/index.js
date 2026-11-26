@@ -1423,7 +1423,7 @@ require('./talento')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, tod
 require('./estandares')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, ...SCOPE })
 // Calidad IPS · Documentos generales (ítems principales y carpetas hasta 3 niveles).
 require('./calidad')(app, { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, userHas: (u, m) => userModules(u).includes(m) })
-require('./academico')(app, { directors: () => directors, supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, uploadImage, notifier: () => notifier })
+require('./academico')(app, { directors: () => directors, inPlan, supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, uploadImage, notifier: () => notifier })
 const plt = platform.register(app, { supabase, auth, h, fail, clean, JWT_SECRET, ISO_DATE, MODULE_KEYS })
 legal = require('./legal')(app, { supabase, auth, h, fail, clean, ADMIN, platform: plt, pauth: plt.pauth })
 require('./search')(app, { supabase, auth, h, fail, clean, userModules, ...SCOPE })
