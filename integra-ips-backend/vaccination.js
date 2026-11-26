@@ -109,6 +109,17 @@ module.exports = (app, deps) => {
   }))
 
   // ---------------------------------------------------------------- Paciente: historial y próxima dosis sugerida
+  // ¿Quién paga la aplicación de una vacuna PAI? EPS del afiliado o, si no está afiliado, el ente territorial.
+  const paiPayer = async (row) => {
+    const pick = (e, reason) => e && ({ id: e.id, name: e.name, reason, agreement: Boolean(e.has_agreement && (!e.agreement_valid_until || e.agreement_valid_until >= today()) && e.payment_mode === 'cuenta_cobro') })
+    if (row.eps_id && row.regimen !== 'no_afiliado') {
+      const { data: e } = await supabase.from('eps_insurers').select('id, name, active, has_agreement, agreement_valid_until, payment_mode').eq('id', row.eps_id).maybeSingle()
+      if (e?.active) return pick(e, row.regimen === 'especial' ? 'régimen especial' : 'afiliado a EPS')
+    }
+    const { data: list } = await supabase.from('eps_insurers').select('id, name, active, has_agreement, agreement_valid_until, payment_mode').eq('kind', 'ente_territorial').eq('active', true).order('name')
+    const terr = (list || []).map((e) => pick(e, 'no afiliado · ente territorial'))
+    return terr.find((x) => x.agreement) || terr[0] || null
+  }
   const RECORD_SELECT = '*, vaccine:vaccines(id, name, code, pai, dose_labels), eps:eps_insurers(name), site:sites(name), vaccinator_user:users!vaccination_records_vaccinator_id_fkey(signature_url), esavi:esavi_reports(id, severity, notified_sivigila), charge:service_charges(invoice_number)'
   const recordDTO = (r) => ({
     id: r.id, siteId: r.site_id, siteName: r.site?.name ?? null, appliedOn: r.applied_on, docType: r.patient_doc_type, docNumber: r.patient_doc_number,
@@ -124,6 +135,12 @@ module.exports = (app, deps) => {
     if (error) throw error
     return data.map(recordDTO)
   }
+  // Vista previa en el formulario: a quién se facturará la aplicación de una vacuna PAI.
+  app.get('/vacunacion/pagador-pai', ...gate, hx(async (req, res) => {
+    if (!inPlan('facturacion')) return res.send({ billingOn: false })
+    const payer = await paiPayer({ eps_id: Number(req.query.eps) || null, regimen: clean(req.query.regimen) })
+    res.send({ billingOn: true, payer })
+  }))
   app.get('/vacunacion/paciente', ...gate, hx(async (req, res) => {
     const doc = String(req.query.documento || '').replace(/[^\dA-Za-z]/g, '')
     if (doc.length < 4) return res.send({ patient: null, records: [] })
@@ -154,7 +171,7 @@ module.exports = (app, deps) => {
     if (b.sex && !SEX.includes(b.sex)) e.push('Sexo inválido')
     if (b.modality && !MODALITIES[b.modality]) e.push('Modalidad inválida')
     for (const m of [V.phoneError(b.phone, 'El celular'), V.emailError(b.email), V.docError(doc, b.docType)]) if (m) e.push(m)
-    const { data: v } = await supabase.from('vaccines').select('*').eq('id', Number(b.vaccineId)).maybeSingle()
+    const { data: v } = await supabase.from('vaccines').select(V_SELECT).eq('id', Number(b.vaccineId)).maybeSingle()
     if (!v || !v.active) e.push('Elige el biológico')
     if (e.length) return fail(res, e.join('. '), 400)
     const site = await targetSite(req, b.siteId)
@@ -229,24 +246,43 @@ module.exports = (app, deps) => {
     const { data, error } = await supabase.from('vaccination_records').insert(row).select(RECORD_SELECT).single()
     if (error) throw error
     if (invoice) await billing.linkInvoice(invoice.id, 'vaccination_records', data.id, `${v.code || v.name} · ${dose}`, { doc, name: `${row.names} ${row.surnames || ''}`.trim() })
-    // Vacuna PAI con EPS en convenio por cuenta de cobro: se factura sola la aplicación a la EPS (promoción y prevención, sin copago).
+    // IIPS-039 · Vacuna PAI: el biológico lo entrega gratis el Ministerio de Salud, pero la aplicación (consulta de
+    // vacunación) sí se cobra, sin copago ni cuota moderadora por ser promoción y mantenimiento (Acuerdo 260 de 2004):
+    //  · afiliado (contributivo, subsidiado o régimen especial): a su EPS / entidad, con cargo a la UPC (Res. 3280 de 2018);
+    //  · no afiliado (población pobre no asegurada, migrante sin aseguramiento): al ente territorial (Ley 715 de 2001).
+    // Con convenio vigente por cuenta de cobro se factura sola; sin convenio queda "por facturar" en Servicios facturables.
     let billed = null
-    if (v.pai && v.tariff_id && row.eps_id && inPlan('facturacion')) {
-      const { data: e2 } = await supabase.from('eps_insurers').select('id, name, has_agreement, agreement_valid_until, payment_mode, active').eq('id', row.eps_id).maybeSingle()
-      const agreement = e2 && e2.active && e2.has_agreement && (!e2.agreement_valid_until || e2.agreement_valid_until >= today()) && e2.payment_mode === 'cuenta_cobro'
-      if (agreement) {
+    if (v.pai && inPlan('facturacion')) {
+      const payer = await paiPayer(row)
+      if (!v.tariff_id) syringeNote = [syringeNote, `Configura el ítem del tarifario de la aplicación de ${v.name} (Vacunación → Biológicos) para facturarla a ${payer ? payer.name : 'la EPS o el ente territorial'}.`].filter(Boolean).join(' ')
+      else if (!payer) syringeNote = [syringeNote, 'No se pudo definir a quién cobrar la aplicación: registra la EPS del paciente o crea el ente territorial (Secretaría de Salud) en Facturación → Proveedores y convenios.'].filter(Boolean).join(' ')
+      else {
         try {
           const { data: svc } = await supabase.from('ips_services').select('id').eq('module', 'cadena_frio').maybeSingle()
-          const chargeId = await billing.createInvoice(req, {
-            serviceId: svc.id, date: applied, docType: row.patient_doc_type, docNumber: doc, names: row.names, surnames: row.surnames, epsId: row.eps_id,
-            paymentMode: 'cuenta_cobro', regimen: ['contributivo', 'subsidiado'].includes(row.regimen) ? row.regimen : null, payerType: 'paciente',
-            items: [{ tariffId: v.tariff_id, quantity: 1 }], siteId: site, description: `${v.name} · ${dose}`
-          })
-          await billing.linkInvoice(chargeId, 'vaccination_records', data.id, `${v.code || v.name} · ${dose}`, { doc, name: `${row.names} ${row.surnames || ''}`.trim() })
-          await supabase.from('vaccination_records').update({ charge_id: chargeId }).eq('id', data.id)
-          const { data: ch } = await supabase.from('service_charges').select('invoice_number, valor').eq('id', chargeId).single()
-          billed = { invoice: ch.invoice_number, valor: Number(ch.valor), eps: e2.name }
-        } catch (err) { syringeNote = [syringeNote, `No se pudo facturar la aplicación a la EPS: ${err.message}`].filter(Boolean).join(' ') }
+          const ref = `${v.code || v.name} · ${dose}`
+          const patient = { doc, name: `${row.names} ${row.surnames || ''}`.trim() }
+          if (payer.agreement) {
+            const chargeId = await billing.createInvoice(req, {
+              serviceId: svc.id, date: applied, docType: row.patient_doc_type, docNumber: doc, names: row.names, surnames: row.surnames, epsId: payer.id,
+              paymentMode: 'cuenta_cobro', regimen: ['contributivo', 'subsidiado'].includes(row.regimen) ? row.regimen : null, payerType: 'paciente',
+              items: [{ tariffId: v.tariff_id, quantity: 1 }], siteId: site, description: `Aplicación ${v.name} · ${dose} (PAI · ${payer.reason})`
+            })
+            await billing.linkInvoice(chargeId, 'vaccination_records', data.id, ref, patient)
+            await supabase.from('vaccination_records').update({ charge_id: chargeId }).eq('id', data.id)
+            const { data: ch } = await supabase.from('service_charges').select('invoice_number, valor').eq('id', chargeId).single()
+            billed = { invoice: ch.invoice_number, valor: Number(ch.valor), eps: payer.name, payer: payer.name, reason: payer.reason }
+          } else {
+            const t = v.tariff
+            const chargeId = await billing.recordCharge({
+              site_id: site, service_id: svc.id, service_name: 'Vacunación', source_table: 'vaccination_records', source_id: data.id, service_date: applied,
+              patient_name: patient.name, patient_doc: `${row.patient_doc_type || ''} ${doc}`.trim(), patient_doc_type: row.patient_doc_type, patient_doc_number: doc, patient_names: row.names, patient_surnames: row.surnames,
+              description: `Aplicación ${v.name} · ${dose} (PAI · ${payer.reason})`, reference: ref, eps_id: payer.id, valor_base: Number(t.price), discount_amount: 0, valor: Number(t.price),
+              payment_mode: 'contado', billing_status: 'por_facturar', created_by: req.user.id
+            }, [{ tariff_id: v.tariff_id, name: t.name, quantity: 1, unit_price: Number(t.price), subtotal: Number(t.price), is_pyp: true }])
+            await supabase.from('vaccination_records').update({ charge_id: chargeId }).eq('id', data.id)
+            billed = { pending: true, valor: Number(t.price), payer: payer.name, reason: payer.reason }
+          }
+        } catch (err) { syringeNote = [syringeNote, `No se pudo facturar la aplicación a ${payer.name}: ${err.message}`].filter(Boolean).join(' ') }
       }
     }
     res.status(201).send({ ...recordDTO(data), invoice: billed?.invoice ?? recordDTO(data).invoice, billed, warning: syringeNote })

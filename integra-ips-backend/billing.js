@@ -14,7 +14,7 @@ module.exports = (app, deps) => {
   const REGIMEN = ['contributivo', 'subsidiado', 'ambos', 'especial']
   const MODES = ['contado', 'cuenta_cobro']
   // Entidades con convenio o responsables de pago (no solo EPS).
-  const ENTITY_KINDS = ['eps', 'aseguradora', 'clinica', 'hospital_publico', 'empresa_publica', 'empresa_privada', 'ips', 'otra']
+  const ENTITY_KINDS = ['eps', 'aseguradora', 'clinica', 'hospital_publico', 'empresa_publica', 'ente_territorial', 'empresa_privada', 'ips', 'otra']
   const httpError = (status, message) => Object.assign(new Error(message), { status })
   const hx = (fn) => h(async (req, res) => { try { await fn(req, res) } catch (e) { if (e.status) return fail(res, e.message, e.status); throw e } })
 
