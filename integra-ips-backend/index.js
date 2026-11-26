@@ -1204,6 +1204,9 @@ app.post('/registrar-toma-de-muestras-citologicas', auth(STAFF), requireIps('cit
     })
   } else {
     row.valor = price; row.valor_base = price; row.payment_mode = 'contado'; row.billing_status = 'por_facturar'
+    // IIPS-038 · Sin Facturación en el sistema: N° de la factura hecha en otro sistema (relación opcional).
+    const ext = clean(body.externalInvoice)
+    if (ext) row.num_factura = ext.slice(0, 40)
   }
 
   // Elaboró / tomó muestra deben ser empleados registrados de la sede.
@@ -1408,7 +1411,7 @@ const SCOPE = { scopeSite, applyScope, canAccessSite, targetSite }
 // IIPS-027 · Historial de servicios por persona (citologías, vacunas, traslados y cobros).
 require('./corr')(app, { supabase, auth, h, fail, clean, ADMIN, todayBogota, uploadImage, ...SCOPE })
 require('./patients')(app, { supabase, auth, h, fail, clean, STAFF, userModules, ...SCOPE })
-const planned = require('./planned')(app, { supabase, auth, h, fail, clean, STAFF, todayBogota, ...SCOPE })
+const planned = require('./planned')(app, { supabase, auth, h, fail, clean, STAFF, todayBogota, inPlan, ...SCOPE })
 require('./socorro')(app, { planned, userModules, notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ADMIN, STAFF, NO_DRIVER, EMAIL_RE, PHONE_RE, ISO_DATE, TZ, TZ_OFFSET, todayBogota, ...SCOPE })
 // Preoperacional diario de vehículos
 require('./inspections')(app, { notify: (...a) => notifier.notify(...a), notifyMsg: () => notifier.messages, notifier: () => notifier, supabase, auth, h, fail, clean, ISO_DATE, TZ, TZ_OFFSET, todayBogota, uploadImage, removeStoredFile, ...SCOPE })

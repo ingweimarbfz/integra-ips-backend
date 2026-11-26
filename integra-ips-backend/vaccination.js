@@ -115,7 +115,7 @@ module.exports = (app, deps) => {
     names: r.names, surnames: r.surnames, patient: `${r.names} ${r.surnames || ''}`.trim(), birthDate: r.birth_date, sex: r.sex, phone: r.phone, email: r.email, address: r.address,
     municipality: r.municipality, epsId: r.eps_id, epsName: r.eps?.name ?? null, regimen: r.regimen, populationGroup: r.population_group, ethnicity: r.ethnicity,
     vaccineId: r.vaccine_id, vaccine: r.vaccine?.name ?? null, vaccineCode: r.vaccine?.code ?? null, pai: r.vaccine?.pai ?? true, dose: r.dose_label, doseIndex: r.dose_index,
-    lot: r.lot, expiry: r.expiry_date, modality: r.modality, vaccinator: r.vaccinator, vaccinatorSignature: r.vaccinator_user?.signature_url ?? null, invoice: r.charge?.invoice_number ?? null, nextDoseDate: r.next_dose_date, nextDoseLabel: r.next_dose_label,
+    lot: r.lot, expiry: r.expiry_date, modality: r.modality, vaccinator: r.vaccinator, vaccinatorSignature: r.vaccinator_user?.signature_url ?? null, invoice: r.charge?.invoice_number ?? r.external_invoice ?? null, externalInvoice: Boolean(!r.charge_id && r.external_invoice), nextDoseDate: r.next_dose_date, nextDoseLabel: r.next_dose_label,
     notes: r.notes, esavi: (r.esavi || []).map((e) => ({ id: e.id, severity: e.severity, notified: e.notified_sivigila })), createdAt: r.created_at,
     age: r.birth_date ? ageYears(r.birth_date, r.applied_on) : null
   })
@@ -222,7 +222,7 @@ module.exports = (app, deps) => {
       sex: b.sex || null, phone: V.phone(b.phone), email: clean(b.email)?.toLowerCase() ?? null, address: clean(b.address), municipality: clean(b.municipality),
       eps_id: Number(b.epsId) || null, regimen: clean(b.regimen), population_group: GROUPS.includes(b.populationGroup) ? b.populationGroup : 'Población general', ethnicity: clean(b.ethnicity),
       vaccine_id: v.id, dose_label: dose, dose_index: doseIndex, lot: item?.lot ?? clean(b.lot), expiry_date: item?.expiry_date ?? null, item_id: item?.id ?? null, vial_id: vialId,
-      modality: b.modality || 'intramural', vaccinator_id: vaccinator.id, vaccinator: vaccinator.fullName, charge_id: invoice?.id ?? null,
+      modality: b.modality || 'intramural', vaccinator_id: vaccinator.id, vaccinator: vaccinator.fullName, charge_id: invoice?.id ?? null, external_invoice: !invoice && !inPlan('facturacion') ? (clean(b.externalInvoice)?.slice(0, 40) ?? null) : null,
       next_dose_date: nextLabel && interval ? addDays(applied, interval) : (dose === 'Anual' ? addDays(applied, 365) : null),
       next_dose_label: nextLabel && interval ? nextLabel : (dose === 'Anual' ? 'Anual' : null), notes: clean(b.notes), created_by: req.user.id
     }
