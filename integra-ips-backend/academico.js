@@ -28,7 +28,9 @@ const EXPIRY_WARN_DAYS = 180
 const alerts = require('./alerts')
 
 module.exports = (app, deps) => {
-  const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, uploadImage, notifier } = deps
+  const { supabase, auth, h, fail, clean, ADMIN, ISO_DATE, todayBogota, scopeSite, canAccessSite, targetSite, uploadImage, notifier, inPlan } = deps
+  // IIPS-038 · Con el módulo de Facturación apagado no se emiten facturas aquí: cada pago lleva el N° de la factura externa.
+  const billingOn = () => (inPlan ? inPlan('facturacion') : true)
   const STAFF = ['administrador', 'empleado']
   const httpError = (status, message) => Object.assign(new Error(message), { status })
   const hx = (fn) => h(async (req, res) => { try { await fn(req, res) } catch (e) { if (e.status) return fail(res, e.message, e.status); throw e } })
@@ -323,7 +325,7 @@ module.exports = (app, deps) => {
   }))
 
   // ---------------------------------------------------------------- Matrículas, liquidación y cuenta por cobrar
-  const ENROLL_SELECT = '*, program:edu_programs(id, code, name, kind, billing_mode, period_label, cert_type, registration_number), group:edu_groups(id, code, shift), period:edu_program_periods(id, number, name), student:edu_students(id, first_name, last_name, doc_type, doc_number, site_id, phone, email, address, municipality, user_id), plan:edu_installments(id, number, due_date, amount), payments:edu_payments(id, receipt_number, paid_at, amount, method, reference, notes, voided, voided_reason, voided_at, created_at)'
+  const ENROLL_SELECT = '*, program:edu_programs(id, code, name, kind, billing_mode, period_label, cert_type, registration_number), group:edu_groups(id, code, shift), period:edu_program_periods(id, number, name), student:edu_students(id, first_name, last_name, doc_type, doc_number, site_id, phone, email, address, municipality, user_id), plan:edu_installments(id, number, due_date, amount), payments:edu_payments(id, receipt_number, paid_at, amount, method, reference, external_invoice, notes, voided, voided_reason, voided_at, created_at)'
   const PAY_METHODS = { efectivo: 'Efectivo', transferencia: 'Transferencia', tarjeta: 'Tarjeta', consignacion: 'Consignación', convenio: 'Pago del convenio', otro: 'Otro' }
   // Cuenta de la matrícula: los pagos vigentes se aplican a las cuotas en orden de vencimiento.
   const account = (e) => {
@@ -345,7 +347,7 @@ module.exports = (app, deps) => {
       total, paid, balance, overdue: overdue.reduce((a, q) => a + q.balance, 0), overdueCount: overdue.length,
       maxDaysLate: overdue.reduce((a, q) => Math.max(a, q.daysLate), 0), nextDue: plan.find((q) => q.balance > 0) || null,
       state: balance <= 0 ? 'paz_y_salvo' : overdue.length ? 'en_mora' : 'al_dia', plan,
-      payments: (e.payments || []).sort((a, b) => b.receipt_number - a.receipt_number).map((p) => ({ id: p.id, receiptNumber: p.receipt_number, paidAt: p.paid_at, amount: Number(p.amount), method: p.method, methodLabel: PAY_METHODS[p.method], reference: p.reference, notes: p.notes, voided: p.voided, voidedReason: p.voided_reason, createdAt: p.created_at }))
+      payments: (e.payments || []).sort((a, b) => b.receipt_number - a.receipt_number).map((p) => ({ id: p.id, receiptNumber: p.receipt_number, paidAt: p.paid_at, amount: Number(p.amount), method: p.method, methodLabel: PAY_METHODS[p.method], reference: p.reference, externalInvoice: p.external_invoice, notes: p.notes, voided: p.voided, voidedReason: p.voided_reason, createdAt: p.created_at }))
     }
   }
   const enrollDTO = (e) => ({
@@ -530,6 +532,7 @@ module.exports = (app, deps) => {
     return data
   }
   const invoiceEnrollment = async (e) => {
+    if (!billingOn()) return false
     const patch = {}
     const now = new Date().toISOString()
     if (!e.invoice_number && Number(e.total_value) > 0) Object.assign(patch, { invoice_number: await nextInvoiceNumber(), invoiced_at: now })
@@ -539,6 +542,7 @@ module.exports = (app, deps) => {
   }
   app.post('/academico/matriculas/:id/facturar', auth(STAFF), hx(async (req, res) => {
     const e = await loadEnrollment(req, req.params.id)
+    if (!billingOn()) return fail(res, 'El módulo de Facturación está desactivado: registra el N° de la factura externa en cada pago', 400)
     if (!['matriculado', 'finalizado', 'aplazado'].includes(e.status)) return fail(res, 'Solo se facturan matrículas en estado matriculado', 400)
     if (!(await invoiceEnrollment(e))) return fail(res, 'La matrícula ya está facturada (o no tiene valor a facturar)', 409)
     res.send(enrollDTO(await loadEnrollment(req, e.id)))
@@ -664,7 +668,8 @@ module.exports = (app, deps) => {
       const receipt = (last?.receipt_number || 0) + 1
       const { data, error } = await supabase.from('edu_payments').insert({
         enrollment_id: e.id, receipt_number: receipt, paid_at: date(b.paidAt) || todayBogota(), amount, method,
-        reference: clean(b.reference)?.slice(0, 80) ?? null, notes: clean(b.notes)?.slice(0, 300) ?? null, created_by: req.user.id
+        reference: clean(b.reference)?.slice(0, 80) ?? null, notes: clean(b.notes)?.slice(0, 300) ?? null, created_by: req.user.id,
+        external_invoice: billingOn() ? null : (clean(b.externalInvoice)?.slice(0, 40) ?? null)
       }).select('id').single()
       if (duplicate(error)) continue
       if (error) throw error
@@ -689,7 +694,7 @@ module.exports = (app, deps) => {
     const raw = await must(supabase.from('edu_enrollments').select('student:edu_students(first_name, last_name, doc_type, doc_number, phone, email, address, municipality)').eq('id', p.enrollment_id).single())
     const cashier = p.created_by ? (await supabase.from('users').select('name, last_name').eq('id', p.created_by).maybeSingle()).data : null
     res.send({
-      id: p.id, receiptNumber: p.receipt_number, paidAt: p.paid_at, amount: Number(p.amount), method: p.method, methodLabel: PAY_METHODS[p.method], reference: p.reference, notes: p.notes,
+      id: p.id, receiptNumber: p.receipt_number, paidAt: p.paid_at, amount: Number(p.amount), method: p.method, methodLabel: PAY_METHODS[p.method], reference: p.reference, externalInvoice: p.external_invoice, notes: p.notes,
       voided: p.voided, voidedReason: p.voided_reason, createdAt: p.created_at, cashier: cashier ? `${cashier.name} ${cashier.last_name}`.trim() : null,
       student: raw.student ? { fullName: `${raw.student.first_name} ${raw.student.last_name}`.trim(), docType: raw.student.doc_type, docNumber: raw.student.doc_number, phone: raw.student.phone, email: raw.student.email, address: [raw.student.address, raw.student.municipality].filter(Boolean).join(', ') } : null,
       enrollment: { id: e.id, program: e.program, group: e.group, period: e.period, academicPeriod: e.academicPeriod, totalValue: e.totalValue, account: { total: e.account.total, paid: e.account.paid, balance: e.account.balance, nextDue: e.account.nextDue } },

@@ -8,14 +8,14 @@
 const alerts = require('./alerts')
 
 module.exports = (app, deps) => {
-  const { supabase, auth, h, fail, clean, STAFF, scopeSite, canAccessSite, todayBogota } = deps
+  const { supabase, auth, h, fail, clean, STAFF, scopeSite, canAccessSite, todayBogota, inPlan } = deps
   const httpError = (status, message) => Object.assign(new Error(message), { status })
   const hx = (fn) => h(async (req, res) => { try { await fn(req, res) } catch (e) { if (e.status) return fail(res, e.message, e.status); throw e } })
   const AREAS = { socorro: 'Servicio de socorro', educacion: 'Actividad de educación', traslado: 'Traslado asistencial' }
   const STATUS = { borrador: 'Borrador', cotizado: 'Cotizado', aprobado: 'Aprobado por el cliente', ejecutado: 'Ejecutado', cancelado: 'Cancelado' }
   const AGRUPACIONES = ['Socorrismo', 'Damas Grises', 'Juventud']
   const VEHICLE_TYPES = { TAB: 'Ambulancia TAB', TAM: 'Ambulancia TAM', otro: 'Otro vehículo' }
-  const SELECT = '*, site:sites(id, name), coordinator:volunteers(id, first_name, last_name, document, phone, agrupacion), creator:users!planned_events_created_by_fkey(name, last_name), event:gso_events(id, code, area, status), trip:vehicle_trips(id, code, status)'
+  const SELECT = '*, site:sites(id, name), coordinator:volunteers(id, first_name, last_name, document, phone, agrupacion), creator:users!planned_events_created_by_fkey(name, last_name), event:gso_events(id, code, area, status), trip:vehicle_trips(id, code, status), charge:service_charges(id, invoice_number, invoiced_at, valor, total_invoice, payer_name, billing_status)'
   const num = (v, d = 0) => (v === '' || v === null || v === undefined || Number.isNaN(Number(v)) ? d : Number(v))
   const fullName = (u) => (u ? `${u.name || u.first_name} ${u.last_name}`.trim() : null)
 
@@ -35,6 +35,7 @@ module.exports = (app, deps) => {
       priceItems: t.lines, total: t.total, notes: p.notes, validUntil: p.valid_until,
       event: p.event ? { id: p.event.id, code: p.event.code, area: p.event.area, status: p.event.status } : null,
       trip: p.trip ? { id: p.trip.id, code: p.trip.code, status: p.trip.status } : null,
+      invoice: p.invoice_number ? { number: p.invoice_number, chargeId: p.charge_id, external: !p.charge_id, invoicedAt: p.invoiced_at, total: p.charge ? Number(p.charge.total_invoice ?? p.charge.valor) : null, payer: p.charge?.payer_name ?? null } : null,
       createdBy: fullName(p.creator), createdAt: p.created_at, updatedAt: p.updated_at,
       volunteersTotal: (p.personnel || []).reduce((a, x) => a + num(x.quantity), 0)
     }
@@ -142,6 +143,62 @@ module.exports = (app, deps) => {
     await supabase.from('planned_events').update({ status: 'ejecutado', event_id: eventId, trip_id: tripId, updated_at: new Date().toISOString() })
       .eq('id', Number(plannedId)).in('status', ['cotizado', 'aprobado', 'borrador'])
   }
+
+  // ---------------------------------------------------------------- IIPS-038 · Factura del evento
+  // Con Facturación activa: se busca y enlaza la factura hecha en Facturación → Servicios facturables.
+  // Sin Facturación: se escribe el N° de la factura del sistema externo para dejar la relación.
+  const billingOn = () => (inPlan ? inPlan('facturacion') : true)
+  app.get('/eventos-previos-facturas', auth(STAFF), hx(async (req, res) => {
+    if (!billingOn()) return res.send([])
+    const q = String(req.query.q || '').trim().toUpperCase()
+    if (q.length < 3) return fail(res, 'Escribe al menos 3 caracteres', 400)
+    const fv = /^FV-?\d+$/.test(q) ? `FV-${q.replace(/\D/g, '').padStart(7, '0')}` : null
+    const digits = q.replace(/[^\dA-Z]/g, '')
+    let sq = supabase.from('service_charges').select('id, invoice_number, invoiced_at, service_date, service_name, description, payer_name, payer_doc_number, patient_name, valor, total_invoice, billing_status, site_id, source_table, source_id')
+      .not('invoice_number', 'is', null).not('billing_status', 'in', '(anulada,por_facturar)').order('service_date', { ascending: false }).limit(20)
+    sq = fv ? sq.eq('invoice_number', fv) : sq.or(`payer_doc_number.eq.${digits},patient_doc_number.eq.${digits},invoice_number.ilike.%${digits}%`)
+    const site = scopeSite(req); if (site) sq = sq.eq('site_id', site)
+    const { data, error } = await sq
+    if (error) throw error
+    const { data: used } = await supabase.from('planned_events').select('id, code, charge_id').in('charge_id', data.map((c) => c.id).concat(0))
+    res.send(data.map((c) => {
+      const u = (used || []).find((x) => x.charge_id === c.id)
+      return { id: c.id, number: c.invoice_number, date: c.service_date, service: c.service_name, description: c.description, payer: c.payer_name || c.patient_name, payerDoc: c.payer_doc_number, total: Number(c.total_invoice ?? c.valor), usedBy: u ? u.code : null, linkedElsewhere: Boolean(!u && c.source_table && c.source_table !== 'planned_events') }
+    }))
+  }))
+  app.put('/eventos-previos/:id/factura', auth(STAFF), hx(async (req, res) => {
+    const cur = await load(req, req.params.id)
+    if (['borrador', 'cancelado'].includes(cur.status)) return fail(res, 'Solo se factura un evento cotizado, aprobado o ejecutado', 400)
+    const now = new Date().toISOString()
+    let patch
+    if (billingOn()) {
+      const id = Number(req.body?.chargeId)
+      if (!id) return fail(res, 'Busca y elige la factura del evento', 400)
+      const { data: c } = await supabase.from('service_charges').select('id, invoice_number, billing_status, site_id, source_table, source_id').eq('id', id).maybeSingle()
+      if (!c || !c.invoice_number) return fail(res, 'Factura no encontrada', 404)
+      if (['anulada', 'por_facturar'].includes(c.billing_status)) return fail(res, 'La factura no está vigente', 400)
+      if (c.site_id && !canAccessSite(req, c.site_id)) return fail(res, 'No tienes acceso a esa factura', 403)
+      const { data: other } = await supabase.from('planned_events').select('code').eq('charge_id', id).neq('id', cur.id).maybeSingle()
+      if (other) return fail(res, `La factura ${c.invoice_number} ya está asociada al evento ${other.code}`, 409)
+      if (c.source_table && c.source_table !== 'planned_events') return fail(res, `La factura ${c.invoice_number} ya corresponde a otro servicio`, 409)
+      patch = { charge_id: c.id, invoice_number: c.invoice_number, invoiced_at: now }
+      await supabase.from('service_charges').update({ source_table: 'planned_events', source_id: cur.id, reference: cur.code }).eq('id', c.id)
+    } else {
+      const n = clean(req.body?.invoiceNumber)
+      if (!n) return fail(res, 'Escribe el número de la factura', 400)
+      patch = { charge_id: null, invoice_number: n.slice(0, 40), invoiced_at: now }
+    }
+    if (cur.charge_id && cur.charge_id !== patch.charge_id) await supabase.from('service_charges').update({ source_table: null, source_id: null }).eq('id', cur.charge_id).eq('source_table', 'planned_events')
+    const { error } = await supabase.from('planned_events').update({ ...patch, updated_at: now }).eq('id', cur.id)
+    if (error) throw error
+    res.send(dto(await load(req, cur.id)))
+  }))
+  app.delete('/eventos-previos/:id/factura', auth(STAFF), hx(async (req, res) => {
+    const cur = await load(req, req.params.id)
+    if (cur.charge_id) await supabase.from('service_charges').update({ source_table: null, source_id: null }).eq('id', cur.charge_id).eq('source_table', 'planned_events')
+    await supabase.from('planned_events').update({ charge_id: null, invoice_number: null, invoiced_at: null, updated_at: new Date().toISOString() }).eq('id', cur.id)
+    res.send(dto(await load(req, cur.id)))
+  }))
 
   // Avisos: eventos aprobados que empiezan en los próximos 7 días y cotizaciones vencidas sin respuesta.
   alerts.register({
